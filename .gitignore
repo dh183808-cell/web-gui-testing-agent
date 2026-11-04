@@ -1,0 +1,60 @@
+# ------------------------------------------------------------
+# Local Codex instructions and private development reports
+# ------------------------------------------------------------
+AGENTS.md
+/docs/
+
+# ------------------------------------------------------------
+# Local environment, credentials, and secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ------------------------------------------------------------
+# Python virtual environments and caches
+# ------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# ------------------------------------------------------------
+# WebAgent execution outputs
+# Keep the tracked placeholder of the original v0.3 project
+# ------------------------------------------------------------
+/artifacts/*
+!/artifacts/.gitkeep
+
+# Safeguard against generated run outputs copied to project root
+/generated_test*.py
+/test_contract.json
+/evidence*.json
+/final_verdict.json
+/report.html
+/repair_request.json
+/recovery_history.json
+/probe_request.json
+/probe_result.json
+
+# ------------------------------------------------------------
+# Local logs, editors, and operating systems
+# ------------------------------------------------------------
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
