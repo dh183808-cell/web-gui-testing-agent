@@ -13,7 +13,7 @@ import traceback
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .evidence_plan import collect_checkpoint
+from .evidence_plan import collect_checkpoint, normalize_id
 
 
 def make_driver(*, headless: bool = True):
@@ -36,12 +36,6 @@ def make_driver(*, headless: bool = True):
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(30)
     return driver
-
-
-def normalize_id(url: str) -> str:
-    path = urlparse(url).path
-    m = re.search(r"/abs/([^?#]+)", path)
-    return m.group(1).replace(".pdf", "") if m else ""
 
 
 def _first_displayed(driver, css: list[str], *, timeout: int = 12):

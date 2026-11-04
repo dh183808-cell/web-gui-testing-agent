@@ -13,16 +13,17 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 import uuid
 
 from .agents import (Agent1TestDesigner, Agent2TestReviewer,
-                     Agent5EvidenceVerifier, Agent6RecoveryController)
+                     Agent4TestExecutor, Agent5EvidenceVerifier, Agent6RecoveryController)
+from .agents.verifier import missing_oracle_evidence as _missing_oracle_evidence
 from .dom_inspector import compact_dom, inspect_page
 from .fixture_server import local_fixture, search_form
 from .generator import Agent3SeleniumGenerator
-from .probe import make_probe_request, merge_probe
+from .probe import merge_probe
 from .report import html_report
+from .schema import JSONModel
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REQUIREMENT = '在 arXiv 中搜索“GUI Agent”，打开第一篇论文，确认结果列表与详情页的标题和论文 ID 一致。'
@@ -34,76 +35,23 @@ def _write_json(path: Path, obj: dict | list):
 
 
 def _run_script(script: Path, run_dir: Path, *, attempt: int, env: dict) -> dict:
-    evidence_name = 'evidence.json' if attempt == 1 else f'evidence_attempt{attempt}.json'
-    log_name = 'runner.log' if attempt == 1 else f'runner_attempt{attempt}.log'
-    try:
-        result = subprocess.run([sys.executable, str(script)], cwd=str(ROOT), env=env,
-                                timeout=100, capture_output=True, text=True)
-        (run_dir / log_name).write_text((result.stdout + '\n' + result.stderr)[-16000:], encoding='utf-8')
-        p = run_dir / evidence_name
-        if p.exists():
-            evidence = json.loads(p.read_text(encoding='utf-8'))
-            if result.returncode != 0 and evidence.get('execution_status') == 'COMPLETE':
-                evidence['execution_status'] = 'ERROR'
-                evidence['error_stage'] = 'subprocess_exit'
-                evidence['error'] = f'Script exited with code {result.returncode} despite COMPLETE evidence'
-                _write_json(p, evidence)
-        else:
-            evidence = {'execution_status': 'ERROR',
-                        'error': 'Executor process failed: ' + (result.stderr or 'No evidence produced')[-1300:],
-                        'error_stage': 'subprocess_execution', 'steps': [], 'screenshots': []}
-            _write_json(p, evidence)
-    except subprocess.TimeoutExpired:
-        evidence = {'execution_status': 'ERROR', 'error': '执行超过 100 秒，子进程已终止',
-                    'error_stage': 'subprocess_timeout', 'steps': [], 'screenshots': []}
-        _write_json(run_dir / evidence_name, evidence)
-    return evidence
-
-
-def _missing_oracle_evidence(contract: dict, evidence: dict, checks: list[dict]) -> list[str]:
-    missing_ids = {c.get('oracle_id') for c in checks if c.get('passed') is None}
-    missing: list[str] = []
-    for oracle in contract['oracles']:
-        if oracle['id'] not in missing_ids:
-            continue
-        for path in (oracle['left'], oracle['right']):
-            if path.startswith('query.'):
-                continue
-            from .evidence_plan import get_path
-            value = get_path(evidence, path)
-            if (value is None or isinstance(value, str) and not value.strip()) and path not in missing:
-                missing.append(path)
-    return missing
+    """Compatibility hook; execution belongs to Agent4."""
+    return Agent4TestExecutor(root=ROOT, runner=subprocess.run).execute(
+        script, run_dir, attempt=attempt, env=env)
 
 
 def _run_probe(request: dict, run_dir: Path, base_url: str, *, env: dict,
                headless: bool, demo_delay: float, allow_live: bool) -> dict:
-    request_path = run_dir / 'probe_request.json'
-    result_path = run_dir / 'probe_result.json'
-    _write_json(request_path, request)
-    args = [sys.executable, '-m', 'web_agent.probe_runner', '--request', str(request_path),
-            '--output', str(result_path), '--base-url', base_url, '--demo-delay', str(demo_delay)]
-    if not headless:
-        args.append('--show-browser')
-    if allow_live:
-        args.append('--allow-live')
-    try:
-        proc = subprocess.run(args, cwd=str(ROOT), env=env, timeout=45,
-                              capture_output=True, text=True)
-        (run_dir / 'probe_runner.log').write_text((proc.stdout + '\n' + proc.stderr)[-10000:], encoding='utf-8')
-        if result_path.exists():
-            return json.loads(result_path.read_text(encoding='utf-8'))
-        result = {'status': 'ERROR', 'error': 'Probe process failed: ' + (proc.stderr or 'No probe evidence')[-700:]}
-    except subprocess.TimeoutExpired:
-        result = {'status': 'ERROR', 'error': 'Probe exceeded its 45-second budget'}
-    _write_json(result_path, result)
-    return result
+    """Compatibility hook; Pipeline has already authorized this probe."""
+    return Agent4TestExecutor(root=ROOT, runner=subprocess.run).probe(
+        request, run_dir, base_url, env=env, headless=headless,
+        demo_delay=demo_delay, allow_live=allow_live)
 
 
 def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixture',
                  mode: str = 'template', headless: bool = True, demo_delay: float = 0.0,
                  allow_live_site: bool = False, only_generate: bool = False,
-                 output_root: Path | None = None, llm=None,
+                 output_root: Path | None = None, llm: JSONModel | None = None,
                  provider: str | None = None, model: str | None = None,
                  max_probes: int = 1, max_repairs: int = 1,
                  enable_live_probes: bool = False, enable_live_recovery: bool = False,
@@ -238,8 +186,7 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
                     _write_json(run_dir / 'evidence.json', evidence)
                     verdict = verifier.verify(contract, evidence)
                 if verdict.status == 'INCONCLUSIVE' and max_probes:
-                    missing = _missing_oracle_evidence(contract, evidence, verdict.checks)
-                    request = make_probe_request(contract, evidence, missing=missing)
+                    request = verifier.plan_probe(contract, evidence, verdict)
                     if request and (target != 'arxiv' or enable_live_probes and allow_live_site):
                         probe = _run_probe(request, run_dir, base_url, env=env,
                                            headless=headless, demo_delay=demo_delay,
