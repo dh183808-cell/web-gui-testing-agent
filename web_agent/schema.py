@@ -3,9 +3,19 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 VERDICTS = {"PASS", "FAIL", "ERROR", "INCONCLUSIVE"}
+
+
+class JSONModel(Protocol):
+    """Shared optional A1/A2/A3 dependency, also implementable by test doubles.
+
+    Provider configuration and credentials belong to llm_adapter. This protocol
+    adds no runtime validation or model instance; errors propagate to the caller.
+    """
+
+    def complete_json(self, system: str, user: str) -> dict[str, Any]: ...
 
 
 def now() -> str:

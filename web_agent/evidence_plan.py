@@ -5,6 +5,8 @@ allowlist stays out of the exchange, and missing fields remain explicit.
 """
 from __future__ import annotations
 
+import re
+from urllib.parse import urlparse
 from typing import Any, Callable
 
 ALLOWED_FIELDS = frozenset({
@@ -65,3 +67,9 @@ def collect_checkpoint(
              'observed': observed, 'missing': missing}
     evidence.setdefault('collection_log', []).append(event)
     return event
+
+
+def normalize_id(url: str) -> str:
+    path = urlparse(url).path
+    m = re.search(r"/abs/([^?#]+)", path)
+    return m.group(1).replace(".pdf", "") if m else ""
