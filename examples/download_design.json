@@ -1,0 +1,88 @@
+{
+  "protocol_version": "0.4",
+  "document_type": "test_design",
+  "requirement": "Download the report and verify that the downloaded file is complete and valid.",
+  "target_url": "$TARGET_URL",
+  "test_goal": "Verify completion and basic integrity of the report download",
+  "requirements": [
+    {
+      "requirement_id": "R_9b89dfb6c1215b4f",
+      "text": "verify that the downloaded file is complete and valid",
+      "source_quote": "verify that the downloaded file is complete and valid",
+      "kind": "assertion"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "S_open",
+      "requirement_ids": [
+        "R_9b89dfb6c1215b4f"
+      ],
+      "action": "navigate",
+      "target": {
+        "description": "download page",
+        "role": "page",
+        "position": null
+      },
+      "depends_on": [],
+      "precondition_ids": [],
+      "inputs": {},
+      "outputs": []
+    },
+    {
+      "step_id": "S_download",
+      "requirement_ids": [
+        "R_9b89dfb6c1215b4f"
+      ],
+      "action": "download",
+      "target": {
+        "description": "检查目标",
+        "role": "semantic_control",
+        "position": null
+      },
+      "depends_on": [
+        "S_open"
+      ],
+      "precondition_ids": [],
+      "inputs": {},
+      "outputs": [
+        "file"
+      ]
+    }
+  ],
+  "preconditions": [],
+  "test_data": [],
+  "oracles": [
+    {
+      "oracle_id": "O_download",
+      "requirement_ids": [
+        "R_9b89dfb6c1215b4f"
+      ],
+      "after_step_id": "S_download",
+      "relation": "file_valid",
+      "actual": {
+        "kind": "evidence",
+        "evidence_id": "E_file"
+      },
+      "expected": {
+        "kind": "literal",
+        "value": true
+      },
+      "evidence_ids": [
+        "E_file"
+      ]
+    }
+  ],
+  "evidence_requirements": [
+    {
+      "evidence_id": "E_file",
+      "step_id": "S_download",
+      "output": "file",
+      "description": "downloaded report file",
+      "kind": "file"
+    }
+  ],
+  "assumptions": [],
+  "missing_information": [],
+  "unsupported_requests": []
+}

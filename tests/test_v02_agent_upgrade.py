@@ -41,7 +41,8 @@ def test_real_mode_short_search_with_title_filter_and_cs():
     evidence["search"]["applied_computer_science"] = False
     assert Agent5EvidenceVerifier().verify(contract, evidence).status == "FAIL"
     evidence["search"].pop("applied_field")
-    assert Agent5EvidenceVerifier().verify(contract, evidence).status == "INCONCLUSIVE"
+    # v0.4 stage 3: confirmed failure takes precedence over unrelated missing evidence.
+    assert Agent5EvidenceVerifier().verify(contract, evidence).status == "FAIL"
 
 
 def test_llm_review_rejects_then_agent1_revises(tmp_path):

@@ -2,6 +2,7 @@
 
 Examples:
   python run_demo.py --target fixture --mode template
+  python run_demo.py --engine dynamic --fixture-site catalog --mode llm --execute-dynamic
   python run_demo.py --target fixture-bug --mode template
   python run_demo.py --target arxiv --mode llm --allow-live-site
   python run_demo.py --target fixture --only-generate
@@ -12,11 +13,21 @@ import argparse
 import json
 import sys
 from web_agent.pipeline import DEFAULT_REQUIREMENT, run_pipeline
+from web_agent.dynamic_execution import ExecutionPolicy
+from web_agent.targets import load_template
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Six Agent arXiv Web GUI Testing Demo v0.3")
+    parser = argparse.ArgumentParser(description="WebAgent v0.4: legacy and dynamic six-agent testing")
+    parser.add_argument("--engine", choices=["legacy", "dynamic"], default="legacy")
     parser.add_argument("--target", choices=["fixture", "fixture-bug", "arxiv"], default="fixture")
+    parser.add_argument("--fixture-site", choices=["catalog", "form", "download"], default=None,
+                        help="dynamic local Fixture workflow; use with --engine dynamic")
+    parser.add_argument("--target-url", default=None, help="dynamic explicit HTTP(S) start URL")
+    parser.add_argument("--execute-dynamic", action="store_true", help="run the reviewed dynamic contract")
+    parser.add_argument("--design-file", default=None, help="authored dynamic TestDesign JSON for template mode")
+    parser.add_argument("--allow-downloads", action="store_true", help="allow reviewed same-origin downloads")
+    parser.add_argument("--allowed-actions", nargs='+', choices=list(ExecutionPolicy().allowed_actions), default=None)
     parser.add_argument("--mode", choices=["template", "llm"], default="template")
     parser.add_argument("--provider", choices=["deepseek", "openrouter", "openai"], default=None,
                         help="LLM provider when --mode llm; default from LLM_PROVIDER or deepseek")
@@ -42,7 +53,13 @@ def main() -> int:
                         help='fixture only: inject an invalid keyword locator and test Agent6 recovery')
     args = parser.parse_args()
     try:
-        r = run_pipeline(requirement=args.requirement, target=args.target,
+        if args.engine == 'legacy' and (args.design_file or args.allow_downloads or args.allowed_actions):
+            raise ValueError('Dynamic design/download/action options require --engine dynamic')
+        policy = ExecutionPolicy(allow_live_site=args.allow_live_site,
+            allow_live_probes=args.enable_live_probes, allow_live_recovery=args.enable_live_recovery,
+            allow_downloads=args.allow_downloads, max_probes=args.max_probes, max_repairs=args.max_repairs,
+            allowed_actions=args.allowed_actions or ExecutionPolicy().allowed_actions) if args.engine == 'dynamic' else None
+        r = run_pipeline(requirement=args.requirement, target=args.target, engine=args.engine,
                          mode=args.mode, headless=not args.show_browser,
                          demo_delay=args.demo_delay, allow_live_site=args.allow_live_site, only_generate=args.only_generate,
                          provider=args.provider, model=args.model,
@@ -50,18 +67,21 @@ def main() -> int:
                          enable_live_probes=args.enable_live_probes,
                          enable_live_recovery=args.enable_live_recovery,
                          demo_evidence_gap=args.demo_evidence_gap,
-                         demo_broken_locator=args.demo_broken_locator)
+                         demo_broken_locator=args.demo_broken_locator,
+                         fixture_site=args.fixture_site, target_url=args.target_url,
+                         execute_dynamic=args.execute_dynamic, execution_policy=policy,
+                         template_design=load_template(args.design_file) if args.design_file else None)
     except Exception as e:
         print(f"Pipeline error: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
     print(json.dumps({"status": r["verdict"]["status"], "message": r["verdict"]["message"],
                       "report": r["report"], "run_dir": r["run_dir"],
-                      "dom_source": r["inspector"]["inspector_source"],
-                      "workflow": r["contract"]["case_id"],
+                      "dom_source": r.get("inspector", {}).get("inspector_source", "dynamic_session"),
+                      "workflow": (r.get("contract") or {}).get("case_id", "dynamic"),
                       "review_attempts": len(r.get("reviews", [])),
                       "probe_count": r.get("probe_count", 0),
                       "repair_count": r.get("repair_count", 0)}, ensure_ascii=False, indent=2))
-    return 0 if args.only_generate or r["verdict"]["status"] == "PASS" else 1
+    return 0 if args.only_generate or (args.engine == 'dynamic' and not args.execute_dynamic and r.get('planning_status') == 'PLANNED') or r["verdict"]["status"] == "PASS" else 1
 
 
 if __name__ == "__main__":
