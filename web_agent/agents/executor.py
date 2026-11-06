@@ -27,6 +27,15 @@ class Agent4TestExecutor:
         self.root = Path(root) if root is not None else Path(__file__).resolve().parents[2]
         self._runner = runner if runner is not None else subprocess.run
 
+    def open_dynamic(self, contract, run_dir: Path, *, policy, headless=True):
+        """Own a persistent worker session; callers must close/use a context manager.
+
+        The returned transport exposes observe/execute, never the WebDriver.
+        Agent4's worker owns Chrome, network policy, output state and cleanup.
+        """
+        from ..browser_session import BrowserSession
+        return BrowserSession(contract, run_dir, policy=policy, headless=headless, root=self.root)
+
     def execute(self, script: Path, run_dir: Path, *, attempt: int, env: dict[str, str]) -> dict[str, Any]:
         """Run a generated script (100s); persist attempt evidence and runner log.
 

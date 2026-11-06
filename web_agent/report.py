@@ -88,3 +88,52 @@ pre{{background:#f0f3f9;padding:15px;white-space:pre-wrap;overflow-wrap:anywhere
     path = run_dir / "report.html"
     path.write_text(doc, encoding="utf-8")
     return path
+
+
+def dynamic_html_report(run_dir: Path, result: dict) -> Path:
+    """Render the stage-4 dynamic result without assuming v0.3 fields."""
+    run_dir = Path(run_dir)
+    verdict = result.get('verdict', {})
+    contract = result.get('contract')
+    if contract is None:
+        contract = {'protocol_version': '0.4', 'document_type': 'test_design',
+                    'design': result.get('design', {}), 'design_digest': None}
+    design = contract.get('design', contract)
+    checks = verdict.get('checks', [])
+    rows = ''.join(f"<tr><td>{escape(str(c.get('oracle_id')))}</td><td>{escape(str(c.get('passed')))}</td>"
+                   f"<td>{escape(str(c.get('expected')))}</td><td>{escape(str(c.get('actual')))}</td></tr>" for c in checks)
+    steps = result.get('steps', [])
+    step_rows = ''.join(f"<tr><td>{escape(str(s.get('step_id')))}</td><td>{escape(str(s.get('status')))}</td>"
+                        f"<td>{escape(str(s.get('attempt', 1)))}</td><td>{escape(str(s.get('observation_id')))}</td>"
+                        f"<td><code>{escape(str(s.get('source_sha256','')))}</code></td></tr>" for s in steps)
+    html = f'''<!doctype html><meta charset="utf-8"><title>WebAgent v0.4 dynamic report</title>
+<style>body{{font:15px system-ui;margin:30px auto;max-width:1200px;color:#17243d}}section{{border:1px solid #dce5f0;border-radius:10px;padding:18px;margin:18px 0}}table{{width:100%;border-collapse:collapse}}td,th{{padding:8px;border-bottom:1px solid #e5eaf2;text-align:left}}pre{{white-space:pre-wrap;background:#f3f6fa;padding:12px}}.status{{font-size:22px;font-weight:bold}}</style>
+<h1>WebAgent v0.4 动态测试报告</h1><p class="status">{escape(str(verdict.get('status')))} · {escape(str(verdict.get('message')))}</p>
+<section><h2>原始需求</h2><p>{escape(str(design.get('requirement')))}</p><p>目标：{escape(str(design.get('target_url')))}</p>
+<h3>协议</h3><pre>{escape(json.dumps({'protocol_version': contract.get('protocol_version'), 'design_digest': result.get('contract_digest'), 'target_config': result.get('target_config')},ensure_ascii=False,indent=2))}</pre></section>
+<section><h2>Agent2 冻结契约</h2><pre>{escape(json.dumps(design,ensure_ascii=False,indent=2))}</pre></section>
+<section><h2>步骤执行与 Agent3 源码摘要</h2><table><tr><th>步骤</th><th>状态</th><th>尝试</th><th>观察</th><th>源码 SHA-256</th></tr>{step_rows}</table></section>
+<section><h2>Agent5 Oracle 结果</h2><table><tr><th>Oracle</th><th>结果</th><th>预期</th><th>实际</th></tr>{rows or '<tr><td colspan="4">无可判定 Oracle</td></tr>'}</table><pre>{escape(json.dumps(result.get('evidence',{}),ensure_ascii=False,indent=2)[:30000])}</pre></section>
+<section><h2>Agent5 补证与 Agent6 恢复</h2><pre>{escape(json.dumps({'probes':result.get('probes',[]),'recovery_history':result.get('recovery_history',[])},ensure_ascii=False,indent=2))}</pre></section>
+<section><h2>执行阶段</h2><pre>{escape(json.dumps(result.get('stages',[]),ensure_ascii=False,indent=2))}</pre></section>'''
+    def json_section(title, value):
+        return f'<section><h2>{escape(title)}</h2><pre>{escape(json.dumps(value, ensure_ascii=False, indent=2))}</pre></section>'
+    html += json_section('Agent2 审核记录', result.get('reviews', []))
+    html += json_section('步骤级状态', result.get('step_states', {}))
+    html += json_section('Oracle 与证据关联', checks)
+    for title, pattern in [('Agent3 实际生成源码', 'generation/*/dynamic_*.py'),
+                           ('Agent3 定位审计', 'generation/*/generation_*.json'),
+                           ('实时 DOM Observation', 'observation_*.json')]:
+        html += '<section><h2>' + escape(title) + '</h2>'
+        for artifact in sorted(run_dir.glob(pattern)):
+            if not artifact.resolve().is_relative_to(run_dir.resolve()) or not artifact.is_file():
+                continue
+            relative = artifact.relative_to(run_dir).as_posix()
+            from urllib.parse import quote
+            html += f'<details><summary><a href="{escape(quote(relative),quote=True)}">{escape(relative)}</a></summary><pre>{escape(artifact.read_text(encoding="utf-8")[:30000])}</pre></details>'
+        html += '</section>'
+    html += json_section('实际执行轨迹', result.get('steps', []))
+    html += '<p>PASS 仅表示当前冻结契约的必要 Oracle 通过。规划完成和执行步骤完成本身不代表 PASS。线上模型/网站能力需单独验证。</p>'
+    path = run_dir / 'dynamic_report.html'
+    path.write_text(html, encoding='utf-8')
+    return path
