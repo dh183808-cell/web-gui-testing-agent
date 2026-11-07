@@ -28,6 +28,13 @@ class Agent6RecoveryController:
         "set_cs_filter": "computer_science",
     }
 
+    def diagnose_dynamic(self, *, stage, result, repairs):
+        return dict(stage=stage, execution_status='ERROR', repairs_used=repairs,
+                    error_type=result.get('error_type'), failed_step=result.get('step_id'),
+                    observation_ref=result.get('observation_ref'),
+                    decision='STOP', reason='Technical execution or budget blocked; no business verdict',
+                    suggestions=['Inspect latest DOM and execution error', 'Check authorized origin and page availability'])
+
     def plan_repair(self, verdict: Verdict, evidence: dict[str, Any], *, target: str,
                     previous_repairs: int = 0, max_repairs: int = 1,
                     live_recovery_allowed: bool = False) -> dict[str, Any] | None:

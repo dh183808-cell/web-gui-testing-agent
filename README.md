@@ -1,5 +1,41 @@
 # WebAgent v0.3 — Selenium Web GUI Testing Agent
 
+The v0.4 dynamic research demo now uses the existing six Agents with real DeepSeek
+and local Chrome. With `DEEPSEEK_API_KEY`, `CHROME_BINARY` and `CHROMEDRIVER_PATH`
+configured on the trusted control side, run:
+
+```powershell
+.\.venv\Scripts\python.exe run_demo.py --target dynamic --mode llm --provider deepseek --url 'https://demo.playwright.dev/todomvc/' --allow-live-site --allow-local-research --requirement 'Add Read book and Write tests. Complete Read book, check it is completed, select Active and verify only Write tests remains.'
+```
+
+The model writes actual Selenium Python in a capability-limited subset; the local
+Worker does not receive API credentials. This is not an OS sandbox. See the local
+Chinese report `docs/v04_phase2_demo_acceptance.md` for actual evidence and limits:
+two successful runs, one technical failure, one interrupted run; three consecutive
+successes and changed-input acceptance were not completed before the user stopped testing.
+
+The v0.4 phase-1 infrastructure supports **local Windows Selenium + Chrome**;
+it is **not wired into the six-agent pipeline yet**. Docker and LLM credentials
+are unnecessary. Run the human-authored, reviewed Fixture programs from the repo root:
+
+```powershell
+.\.venv\Scripts\python.exe run_infrastructure_check.py --driver-path 'C:\path\to\chromedriver.exe'
+```
+
+Use an installed ChromeDriver matching Chrome (or set `CHROMEDRIVER_PATH`);
+this entry does not automatically download drivers. Add `--show-browser` to watch.
+It creates `artifacts/phase1_local_*/acceptance.json`, per-session logs, bounded
+DOM observations and screenshots. Trial/Formal use separate Profiles and resettable
+Fixture data; Windows Job Objects enforce deadlines and clean up owned processes.
+**A local subprocess is not a security sandbox.** Arbitrary/model-generated Python
+is disabled; only registered programs with a pinned reviewed-source hash can run.
+File/network/CPU/memory permission isolation is not provided.
+See `docs/v04_phase1_infrastructure_acceptance.md` for the local Chinese acceptance
+report (the repository currently ignores `docs/`, so this file does not sync).
+The old demos below still use their original trusted template path; they do not
+accept arbitrary model Python. The new local acceptance covers infrastructure,
+not Agent3 autonomous development or a real-model end-to-end run.
+
 > **Six logical roles**, with a working evidence collection plan, targeted re-observation and bounded test-script recovery. Keeps DeepSeek / OpenRouter / OpenAI support from v0.2.2.
 >
 > **Scope**: arXiv advanced-search → results → abstract detail. This is a *restricted engineering prototype*, not a universal 6-LLM-agent browser automation platform.

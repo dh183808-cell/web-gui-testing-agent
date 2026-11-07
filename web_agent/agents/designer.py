@@ -17,6 +17,25 @@ from ..schema import JSONModel, QuerySpec
 class Agent1TestDesigner:
     """Use a model to interpret an arXiv SEARCH intent into a bounded query spec."""
 
+    def design_dynamic(self, requirement, *, url, llm, feedback=None):
+        system = '''You are Agent1, a Web GUI test designer. Turn the original requirement into
+semantic ordered actions and explicit test expectations. No Selenium, selectors or HTML.
+Return JSON {"steps":[{"id":"S1","goal":"..."}],
+"oracles":[{"id":"O1","step_id":"S4","meaning":"...","kind":"equals|contains|set_equals",
+"expected": any JSON literal}],"preconditions":["..."],"missing_inputs":[]}.
+Use 1..12 actions with sequential IDs. The browser ALREADY starts at the supplied URL;
+do not add an initial navigation action. Split interactions into individual steps,
+especially clicks causing navigation/dynamic updates. Expected values MUST reflect user
+data; never invent business success. For only unfinished items, expected list must contain
+only the unfinished item, and also check completed item remains completed before filtering.
+Oracles are DOM-readable facts and are attached to the step where they can be observed.
+No URLs outside the authorized origin, logins, downloads or destructive remote effects.'''
+        data = llm.complete_json(system, json.dumps(dict(requirement=requirement, start_url=url,
+                                                         review_feedback=feedback or []), ensure_ascii=False))
+        from ..schema import validate_dynamic_plan
+        validate_dynamic_plan(data)
+        return dict(data, requirement=requirement, start_url=url, interpretation_mode='real_llm')
+
     def design(self, requirement: str, mode: str = "template", *, llm: JSONModel | None = None,
                feedback: list[str] | None = None) -> dict[str, Any]:
         requirement = requirement.strip()

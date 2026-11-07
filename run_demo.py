@@ -16,7 +16,11 @@ from web_agent.pipeline import DEFAULT_REQUIREMENT, run_pipeline
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Six Agent arXiv Web GUI Testing Demo v0.3")
-    parser.add_argument("--target", choices=["fixture", "fixture-bug", "arxiv"], default="fixture")
+    parser.add_argument("--target", choices=["fixture", "fixture-bug", "arxiv", "dynamic"], default="fixture")
+    parser.add_argument('--url', default=None, help='Explicit initial URL for dynamic GUI testing')
+    parser.add_argument('--allow-local-research', action='store_true', help='Authorize checked local Selenium subset; not an OS sandbox')
+    parser.add_argument('--step-attempts', type=int, default=3)
+    parser.add_argument('--task-repairs', type=int, default=5)
     parser.add_argument("--mode", choices=["template", "llm"], default="template")
     parser.add_argument("--provider", choices=["deepseek", "openrouter", "openai"], default=None,
                         help="LLM provider when --mode llm; default from LLM_PROVIDER or deepseek")
@@ -50,10 +54,15 @@ def main() -> int:
                          enable_live_probes=args.enable_live_probes,
                          enable_live_recovery=args.enable_live_recovery,
                          demo_evidence_gap=args.demo_evidence_gap,
-                         demo_broken_locator=args.demo_broken_locator)
+                         demo_broken_locator=args.demo_broken_locator, start_url=args.url,
+                         allow_local_research=args.allow_local_research,
+                         step_attempts=args.step_attempts, task_repairs=args.task_repairs)
     except Exception as e:
         print(f"Pipeline error: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
+    if args.target == 'dynamic':
+        print(json.dumps(r, ensure_ascii=True, indent=2))
+        return 0 if r['verdict']['status']=='PASS' else 1
     print(json.dumps({"status": r["verdict"]["status"], "message": r["verdict"]["message"],
                       "report": r["report"], "run_dir": r["run_dir"],
                       "dom_source": r["inspector"]["inspector_source"],

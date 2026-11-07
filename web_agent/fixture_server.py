@@ -9,6 +9,7 @@ from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from urllib.parse import parse_qs, urlparse, quote
+import json
 
 PAPERS = [
     {"id": "2601.00001", "title": "Evaluating GUI Agents for Software Testing", "summary": "GUI Agent testing with browser automation and evidence."},
@@ -123,3 +124,62 @@ def local_fixture(*, bug: bool = False):
         server.shutdown()
         server.server_close()
         t.join(timeout=2)
+
+
+@contextmanager
+def runtime_fixture(*, seed: str = 'phase1'):
+    """Private, in-memory data per session. A fresh instance is a trusted reset."""
+    state = {'seed': seed, 'submissions': []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == '/':
+                body = '<h1>Session fixture</h1><a id="next" href="/form">Open form</a>'
+            elif path == '/form':
+                body = '''<section id="task"><h1>Local form</h1>
+                <label for="name">Name</label><input id="name">
+                <button id="load" onclick="setTimeout(() => {document.querySelector('#status').textContent='Ready'; if (!document.querySelector('#continue')) {const b=document.createElement('button');b.id='continue';b.textContent='Continue';b.onclick=()=>document.querySelector('#status').textContent='Continued';document.querySelector('#task').append(b);}}, 150)">Load</button>
+                <p id="status">Waiting</p><button id="menu" onclick="document.querySelector('#dialog').hidden=false">Menu</button>
+                <div id="dialog" role="dialog" hidden>Options</div>
+                <button id="submit" onclick="fetch('/submit', {method:'POST',body:document.querySelector('#name').value}).then(r=>r.json()).then(d=>{document.querySelector('#receipt').textContent=d.count;})">Submit</button>
+                <p id="receipt">0</p></section>'''
+            else:
+                self.send_error(404)
+                return
+            payload = ('<!doctype html><title>Runtime fixture</title>' + body).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(payload)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            if self.path != '/submit':
+                self.send_error(404)
+                return
+            size = int(self.headers.get('Content-Length', '0'))
+            if not 0 <= size <= 1000:
+                self.send_error(413)
+                return
+            state['submissions'].append(self.rfile.read(size).decode('utf-8', errors='replace'))
+            payload = json.dumps({'count': len(state['submissions'])}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_port}', state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

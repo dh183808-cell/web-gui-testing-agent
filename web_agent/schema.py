@@ -8,6 +8,27 @@ from typing import Any, Literal, Protocol
 VERDICTS = {"PASS", "FAIL", "ERROR", "INCONCLUSIVE"}
 
 
+def validate_dynamic_plan(plan):
+    """Small semantic contract; execution selectors belong to Agent3, not this plan."""
+    steps, oracles = plan.get('steps'), plan.get('oracles')
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 12:
+        raise ValueError('Dynamic plan requires 1..12 steps')
+    ids = []
+    for i, step in enumerate(steps, 1):
+        if step.get('id') != f'S{i}' or not isinstance(step.get('goal'), str) or not step['goal'].strip():
+            raise ValueError('Invalid ordered semantic step')
+        ids.append(step['id'])
+    if not isinstance(oracles, list) or not 1 <= len(oracles) <= 12:
+        raise ValueError('Dynamic plan requires explicit oracles')
+    oracle_ids = set()
+    for oracle in oracles:
+        if (not isinstance(oracle.get('id'), str) or oracle['id'] in oracle_ids
+                or oracle.get('step_id') not in ids or oracle.get('kind') not in {'equals','contains','set_equals'}
+                or 'expected' not in oracle or not isinstance(oracle.get('meaning'), str)):
+            raise ValueError('Invalid semantic oracle')
+        oracle_ids.add(oracle['id'])
+
+
 class JSONModel(Protocol):
     """Shared optional A1/A2/A3 dependency, also implementable by test doubles.
 

@@ -22,6 +22,15 @@ def _write_json(path: Path, obj: dict[str, Any]) -> None:
 class Agent4TestExecutor:
     """Execute only scripts/requests supplied by Pipeline in its approved workflow."""
 
+    def execute_dynamic(self, delivery, *, session):
+        import hashlib
+        source = Path(delivery['script_path']).read_text(encoding='utf-8')
+        if hashlib.sha256(source.encode()).hexdigest() != delivery['script_sha256']:
+            raise ValueError('Frozen Agent3 source hash changed before formal execution')
+        if not delivery.get('cold_trial_complete') or session.purpose != 'formal':
+            raise ValueError('Formal execution requires a completed cold trial and independent formal session')
+        return session.execute_program(source, step_ids=delivery['step_ids'], bindings=delivery['bindings'])
+
     def __init__(self, *, root: Path | None = None,
                  runner: Callable[..., subprocess.CompletedProcess[str]] | None = None) -> None:
         self.root = Path(root) if root is not None else Path(__file__).resolve().parents[2]

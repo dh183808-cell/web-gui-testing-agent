@@ -1,22 +1,429 @@
-"""Agent 4 runtime: Selenium actions, phase-aware diagnostics and observable evidence.
+"""Shared Selenium runtime: managed LOCAL trusted sessions and v0.3 actions.
 
-The search submission is bound to the keyword input's owning HTML form. This
-avoids accidentally clicking a similarly named Search control in the site header.
+Local subprocesses have host permissions. Default mode only runs reviewed fixture
+programs; explicit research mode interprets the checked Selenium capability subset.
 """
 from __future__ import annotations
 
+import atexit
+from dataclasses import asdict, dataclass
+import hashlib
 import json
+import math
 import os
-import re
+from pathlib import Path
+import queue
+import shutil
+import subprocess
+import sys
+import threading
 import time
 import traceback
-from pathlib import Path
+import re
+import uuid
 from urllib.parse import parse_qs, urlparse
 
 from .evidence_plan import collect_checkpoint, normalize_id
 
+ROOT = Path(__file__).resolve().parents[1]
+ARTIFACT_ROOT = ROOT / 'artifacts'
+TRUSTED_SCRIPT_IDS = frozenset({'navigate', 'update', 'smoke', 'locator_failure',
+                              'wait_timeout', 'browser_exception', 'deadline'})
+# Review gate for the human-authored fixture asset; never calculate approval at runtime.
+REVIEWED_SCRIPT_SHA256 = '68da6297c3c8827b505ec53e99a9654567bc4a2720df52eb8afc89c77a25d5ce'
 
-def make_driver(*, headless: bool = True):
+
+def reviewed_script():
+    path = ROOT / 'tests' / 'fixtures' / 'runtime_smoke.py'
+    if hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest() != REVIEWED_SCRIPT_SHA256:
+        raise PermissionError('Trusted fixture source changed; human review and hash update required')
+    return path, REVIEWED_SCRIPT_SHA256
+
+
+@dataclass(frozen=True)
+class RuntimeLimits:
+    """Wall-clock limits only. No CPU/memory/file/network sandbox is claimed."""
+    execution_seconds: float = 30
+    startup_seconds: float = 60
+    session_seconds: float = 600
+    step_attempts: int = 3
+    task_repairs: int = 5
+
+    def __post_init__(self):
+        for name, low, high in [('execution_seconds', .1, 300), ('startup_seconds', 1, 180),
+                                ('session_seconds', 1, 1800), ('step_attempts', 1, 3), ('task_repairs', 0, 5)]:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f'Invalid runtime limit: {name}')
+        for name in ('step_attempts', 'task_repairs'):
+            if not isinstance(getattr(self, name), int):
+                raise ValueError(f'{name} must be an integer')
+
+
+class LocalRuntimeUnavailable(RuntimeError):
+    pass
+
+
+def _worker_environment(temp_dir):
+    """Reduce accidental credential inheritance; this is not access isolation."""
+    allowed = {'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMDRIVE'}
+    env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
+    env.update(TEMP=str(temp_dir), TMP=str(temp_dir), PYTHONIOENCODING='utf-8',
+               PYTHONUNBUFFERED='1')
+    return env
+
+
+class _OwnedProcessTree:
+    """Windows Job lifecycle control, NOT a security sandbox."""
+    def __init__(self):
+        if os.name != 'nt':
+            raise LocalRuntimeUnavailable('Managed local sessions currently require Windows Job Objects')
+        import ctypes
+        from ctypes import wintypes as w
+        self.c = ctypes
+        self.k = ctypes.WinDLL('kernel32', use_last_error=True)
+        self.k.CreateJobObjectW.argtypes = [ctypes.c_void_p, w.LPCWSTR]
+        self.k.CreateJobObjectW.restype = w.HANDLE
+        self.k.SetInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD]
+        self.k.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
+        self.k.TerminateJobObject.argtypes = [w.HANDLE, w.UINT]
+        self.k.QueryInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.c_void_p]
+        self.k.CloseHandle.argtypes = [w.HANDLE]
+        class Basic(ctypes.Structure):
+            _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64), ('PerJobUserTimeLimit', ctypes.c_int64),
+                        ('LimitFlags', w.DWORD), ('MinimumWorkingSetSize', ctypes.c_size_t),
+                        ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessLimit', w.DWORD),
+                        ('Affinity', ctypes.c_size_t), ('PriorityClass', w.DWORD), ('SchedulingClass', w.DWORD)]
+        class IO(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in ('ReadOperationCount', 'WriteOperationCount',
+                          'OtherOperationCount', 'ReadTransferCount', 'WriteTransferCount', 'OtherTransferCount')]
+        class Extended(ctypes.Structure):
+            _fields_ = [('BasicLimitInformation', Basic), ('IoInfo', IO),
+                        ('ProcessMemoryLimit', ctypes.c_size_t), ('JobMemoryLimit', ctypes.c_size_t),
+                        ('PeakProcessMemoryUsed', ctypes.c_size_t), ('PeakJobMemoryUsed', ctypes.c_size_t)]
+        self.handle = self.k.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = Extended()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE; no breakaway
+        if not self.k.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign(self, process):
+        if not self.k.AssignProcessToJobObject(self.handle, int(process._handle)):
+            raise self.c.WinError(self.c.get_last_error())
+
+    def active(self):
+        c = self.c
+        from ctypes import wintypes as w
+        class Accounting(c.Structure):
+            _fields_ = [(n, c.c_int64) for n in ('TotalUserTime', 'TotalKernelTime', 'ThisPeriodTotalUserTime', 'ThisPeriodTotalKernelTime')] + [
+                (n, w.DWORD) for n in ('TotalPageFaultCount', 'TotalProcesses', 'ActiveProcesses', 'TotalTerminatedProcesses')]
+        info = Accounting()
+        if not self.k.QueryInformationJobObject(self.handle, 1, c.byref(info), c.sizeof(info), None):
+            raise c.WinError(c.get_last_error())
+        return info.ActiveProcesses
+
+    def terminate(self):
+        if not self.k.TerminateJobObject(self.handle, 1):
+            raise self.c.WinError(self.c.get_last_error())
+
+    def close(self):
+        if self.handle:
+            self.k.CloseHandle(self.handle)
+            self.handle = None
+
+
+class LocalSession:
+    """Control handle; a trusted Worker exclusively owns one persistent WebDriver.
+
+    No WebDriver object crosses the process boundary. Worker commands are limited
+    to observations, registered fixture functions and close. A fresh session also
+    creates a private Fixture server and data store, not just a clean Profile.
+    """
+    def __init__(self, run_dir: Path, *, purpose='trial', seed='phase1', limits=None,
+                 headless=True, driver_path=None, chrome_binary=None, start_url=None, research_mode=False):
+        if purpose not in {'trial', 'development', 'formal'}:
+            raise ValueError('Invalid execution purpose')
+        if not isinstance(seed, str) or len(seed) > 100:
+            raise ValueError('Invalid synthetic seed')
+        root = Path(run_dir).resolve()
+        if not root.is_relative_to(ARTIFACT_ROOT.resolve()):
+            raise ValueError('Run directory must be inside artifacts/')
+        if start_url:
+            from .checked_selenium import origin
+            origin(start_url)
+            if not research_mode:
+                raise ValueError('External sessions require explicit research_mode')
+        reviewed_script()
+        selected_driver = driver_path or os.getenv('CHROMEDRIVER_PATH') or shutil.which('chromedriver')
+        if not selected_driver or not Path(selected_driver).is_file():
+            raise LocalRuntimeUnavailable('Provide an installed ChromeDriver using --driver-path or CHROMEDRIVER_PATH; automatic downloads are disabled')
+        driver_path = Path(selected_driver).resolve()
+        self.limits = limits or RuntimeLimits()
+        self.session_id = uuid.uuid4().hex
+        self.purpose, self.seed = purpose, seed
+        self.run_dir = root / purpose / self.session_id
+        self.run_dir.mkdir(parents=True, exist_ok=False)
+        self.research_mode = research_mode
+        self._options = dict(headless=headless, driver_path=driver_path, chrome_binary=chrome_binary,
+                             start_url=start_url, research_mode=research_mode)
+        self._root = root
+        self._responses = queue.Queue()
+        self._lock = threading.RLock()
+        self._closed, self._proc, self._job, self._timer, self._reader = False, None, None, None, None
+        self._last_url = self._last_observation_ref = None
+        self._expires = None
+        self.cleanup = {'process_tree_terminated': False, 'owned_processes_remaining': None,
+                        'profile_removed': False, 'driver_quit': False}
+        self.metadata = dict(session_id=self.session_id, purpose=purpose, seed=seed,
+                             limits=asdict(self.limits), status='STARTING', execution_mode='local_trusted',
+                             security_sandbox=False)
+        self._exit_handler = self.close_session
+        self._stderr = None
+        try:
+            self._job = _OwnedProcessTree()
+            temp = self.run_dir / 'tmp'
+            temp.mkdir()
+            self._stderr = (self.run_dir / 'worker_stderr.log').open('w', encoding='utf-8')
+            entry = f"import sys;sys.path.insert(0,{str(ROOT)!r});from web_agent.local_worker import main;main()"
+            self._proc = subprocess.Popen([sys.executable, '-I', '-c', entry], cwd=self.run_dir,
+                                          env=_worker_environment(temp), stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, stderr=self._stderr, text=True, encoding='utf-8',
+                                          creationflags=subprocess.CREATE_NO_WINDOW)
+            # Worker waits for init and cannot start Chrome before assignment.
+            self._job.assign(self._proc)
+            self._reader = threading.Thread(target=self._read_responses, daemon=True)
+            self._reader.start()
+            config = dict(run_dir=str(self.run_dir), seed=seed, headless=headless,
+                          start_url=start_url, research_mode=research_mode,
+                          driver_path=str(driver_path or os.getenv('CHROMEDRIVER_PATH') or '') or None,
+                          chrome_binary=str(chrome_binary or os.getenv('CHROME_BINARY') or '') or None)
+            response = self._request(config, self.limits.startup_seconds)
+            if response.get('status') != 'READY':
+                raise LocalRuntimeUnavailable(response.get('error_type', 'Browser startup failed') + ': ' + response.get('error', ''))
+            self.metadata.update(response, status='READY', worker_pid=self._proc.pid,
+                                 owned_processes_at_start=self._job.active())
+            self._last_url = response['base_url']
+            self._expires = time.monotonic() + self.limits.session_seconds
+            self._write('session.json', self.metadata)
+            atexit.register(self._exit_handler)
+            self._timer = threading.Timer(self.limits.session_seconds, self._expire)
+            self._timer.daemon = True
+            self._timer.start()
+        except BaseException:
+            self.close_session(graceful=False)
+            raise
+
+    def _write(self, name, value):
+        (self.run_dir / name).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    def _read_responses(self):
+        try:
+            for line in self._proc.stdout:
+                self._responses.put(json.loads(line))
+        except (ValueError, OSError):
+            pass
+        finally:
+            self._responses.put({'status': 'ERROR', 'error_type': 'WorkerExited', 'error': 'Worker control stream closed'})
+
+    def _request(self, payload, timeout):
+        with self._lock:
+            if self._closed or self._proc is None:
+                raise RuntimeError('Session is closed')
+            if self._expires is not None and payload.get('op') != 'close':
+                timeout = min(timeout, self._expires - time.monotonic())
+                if timeout <= 0:
+                    raise TimeoutError('Managed session deadline exceeded')
+            self._proc.stdin.write(json.dumps(payload) + '\n')
+            self._proc.stdin.flush()
+            try:
+                result = self._responses.get(timeout=timeout)
+            except queue.Empty:
+                raise TimeoutError('Managed execution deadline exceeded') from None
+            if result.get('error_type') == 'WorkerExited':
+                raise LocalRuntimeUnavailable(result['error'])
+            return result
+
+    def _remember(self, observation):
+        self._last_url = observation['url']
+        self._last_observation_ref = observation['observation_ref']
+        return observation
+
+    def observe(self, *, screenshot=False, **options):
+        try:
+            result = self._request({'op': 'observe', 'options': options, 'screenshot': screenshot},
+                                   self.limits.execution_seconds)
+            if result['status'] != 'COMPLETE':
+                raise RuntimeError(result.get('error_type', 'Observation failed'))
+            return self._remember(result['observation'])
+        except Exception:
+            self.close_session(graceful=False)
+            raise
+
+    def execute_checked(self, source, *, step_id=None, queries=None):
+        """Research opt-in: interpret a bounded Selenium subset; never arbitrary Python."""
+        if getattr(self, 'research_mode', False):
+            return self._execute_research(source, step_id=step_id, queries=queries or {})
+        result = dict(status='REJECTED', error_type='UntrustedCodeDisabled',
+                      error='Arbitrary Python execution is disabled in local mode; use a reviewed script ID',
+                      session_id=self.session_id, purpose=self.purpose, elapsed_seconds=0,
+                      current_url=self._last_url, observation_ref=self._last_observation_ref, cleanup=dict(self.cleanup))
+        self._write('rejection_' + uuid.uuid4().hex + '.json', result)
+        return result
+
+    def _execute_research(self, source, *, step_id, queries):
+        from .checked_selenium import validate_source, normalize_bindings
+        started = time.monotonic()
+        result = dict(status='REJECTED', step_id=step_id, execution_id=uuid.uuid4().hex,
+                      session_id=self.session_id, purpose=self.purpose,
+                      current_url=self._last_url, observation_ref=self._last_observation_ref)
+        try:
+            validate_source(source)
+            queries = normalize_bindings(queries, step_id=step_id)
+            result['script_sha256'] = hashlib.sha256(source.encode()).hexdigest()
+            response = self._request({'op': 'checked', 'source': source, 'step_id': step_id,
+                                      'queries': queries}, self.limits.execution_seconds)
+            observation = response.pop('observation', None)
+            result.update(response)
+            if observation:
+                self._remember(observation)
+                result.update(current_url=self._last_url, observation_ref=self._last_observation_ref)
+        except (ValueError, SyntaxError) as exc:
+            result.update(status='REJECTED', error_type=type(exc).__name__, error=str(exc)[:1200])
+        except Exception as exc:
+            result.update(status='TIMEOUT' if isinstance(exc, TimeoutError) else 'ERROR',
+                          error_type=type(exc).__name__, error='Research Worker request failed')
+            self.close_session(graceful=False)
+        result.update(elapsed_seconds=round(time.monotonic()-started, 3), cleanup=dict(self.cleanup))
+        self._write('execution_' + result['execution_id'] + '.json', result)
+        return result
+
+    def execute_program(self, source, *, step_ids, bindings):
+        from .checked_selenium import split_program
+        steps = split_program(source)
+        if [s['id'] for s in steps] != step_ids:
+            raise ValueError('Frozen program does not cover the reviewed steps')
+        results = []
+        for step in steps:
+            queries = {key: query for key, query in bindings.items() if query['step_id'] == step['id']}
+            result = self.execute_checked(step['source'], step_id=step['id'], queries=queries)
+            results.append(result)
+            if result['status'] != 'COMPLETE':
+                break
+        return dict(execution_status='COMPLETE' if len(results) == len(steps) and all(
+                        r['status']=='COMPLETE' for r in results) else 'ERROR',
+                    script_sha256=hashlib.sha256(source.encode()).hexdigest(),
+                    session_id=self.session_id, browser_session_id=self.metadata['browser_session_id'],
+                    purpose=self.purpose, steps=results,
+                    measurements={key: v for r in results for key,v in r.get('measurements',{}).items()})
+
+    def execute_trusted(self, script_id: str):
+        started = time.monotonic()
+        result = dict(status='REJECTED', script_id=script_id, script_sha256=REVIEWED_SCRIPT_SHA256,
+                      execution_id=uuid.uuid4().hex, session_id=self.session_id, purpose=self.purpose,
+                      current_url=self._last_url, observation_ref=self._last_observation_ref)
+        if script_id not in TRUSTED_SCRIPT_IDS:
+            result.update(error_type='UntrustedCodeDisabled', error='Unknown reviewed script ID')
+        else:
+            try:
+                path, digest = reviewed_script()
+                (self.run_dir / 'reviewed_script.py').write_bytes(path.read_bytes())
+                response = self._request({'op': 'execute', 'script_id': script_id}, self.limits.execution_seconds)
+                observation = response.pop('observation', None)
+                result.update(response)
+                if observation:
+                    self._remember(observation)
+                    result.update(current_url=self._last_url, observation_ref=self._last_observation_ref)
+                if result['status'] != 'COMPLETE':
+                    self.close_session()
+            except Exception as exc:
+                result.update(status='TIMEOUT' if isinstance(exc, TimeoutError) else 'ERROR',
+                              error_type=type(exc).__name__, error=str(exc)[:300])
+                self.close_session(graceful=False)
+        result.update(elapsed_seconds=round(time.monotonic() - started, 3), cleanup=dict(self.cleanup))
+        self._write('execution_' + result['execution_id'] + '.json', result)
+        return result
+
+    def _expire(self):
+        self.metadata['termination_reason'] = 'session_deadline'
+        self.close_session(graceful=False)
+
+    def close_session(self, *, graceful=True):
+        with self._lock:
+            if self._closed:
+                return dict(self.cleanup)
+            if self._timer:
+                self._timer.cancel()
+            atexit.unregister(self._exit_handler)
+            if graceful and self._proc and self._proc.poll() is None:
+                try:
+                    self.cleanup['driver_quit'] = self._request({'op': 'close'}, 5).get('driver_quit', False)
+                except Exception:
+                    pass
+            self._closed = True
+            if self._job:
+                try:
+                    self.cleanup['owned_processes_before_termination'] = self._job.active()
+                    self._job.terminate()
+                    until = time.monotonic() + 5
+                    remaining = self._job.active()
+                    while remaining and time.monotonic() < until:
+                        time.sleep(.05)
+                        remaining = self._job.active()
+                    self.cleanup.update(owned_processes_remaining=remaining, process_tree_terminated=remaining == 0)
+                except OSError as exc:
+                    self.cleanup['cleanup_error_type'] = type(exc).__name__
+                finally:
+                    self._job.close()
+            if self._proc:
+                if self._proc.poll() is None:
+                    self._proc.kill()  # also covers failure before Job assignment; no browser launched yet
+                self._proc.wait(timeout=5)
+                if self._reader:
+                    self._reader.join(timeout=2)
+                for stream in (self._proc.stdin, self._proc.stdout):
+                    stream.close()
+            if self._stderr:
+                self._stderr.close()
+            if self.cleanup['process_tree_terminated']:
+                profile = self.run_dir / 'profile'
+                for attempt in range(20):
+                    try:
+                        if profile.exists():
+                            if not profile.resolve().is_relative_to(self.run_dir.resolve()):
+                                raise ValueError('Profile cleanup target escaped its session directory')
+                            shutil.rmtree(profile)
+                        self.cleanup['profile_removed'] = True
+                        break
+                    except OSError:
+                        time.sleep(.1)
+            self.metadata.update(status='CLOSED', cleanup=dict(self.cleanup))
+            self._write('session.json', self.metadata)
+            return dict(self.cleanup)
+
+    def reset_environment(self):
+        if not self.close_session()['process_tree_terminated']:
+            raise LocalRuntimeUnavailable('Previous owned process tree cleanup not confirmed')
+        return create_session(self._root, purpose=self.purpose, seed=self.seed,
+                              limits=self.limits, **self._options)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close_session()
+
+
+def create_session(run_dir: Path, *, purpose='trial', **options) -> LocalSession:
+    return LocalSession(run_dir, purpose=purpose, **options)
+
+
+def make_driver(*, headless: bool = True, profile_dir: Path | None = None,
+                proxy_url: str | None = None, driver_path=None, chrome_binary=None, service_log=None,
+                page_load_strategy='normal'):
     """Import Selenium lazily so contract/generation tests work without a browser."""
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
@@ -27,12 +434,25 @@ def make_driver(*, headless: bool = True):
     if headless:
         opts.add_argument("--headless=new")
     if os.name == "posix":
-        opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
-    if os.getenv("CHROME_BINARY"):
-        opts.binary_location = os.environ["CHROME_BINARY"]
-    opts.page_load_strategy = "normal"
-    service = Service(os.environ["CHROMEDRIVER_PATH"]) if os.getenv("CHROMEDRIVER_PATH") else None
+    if profile_dir is not None:
+        opts.add_argument(f"--user-data-dir={profile_dir}")
+    if proxy_url:
+        opts.add_argument(f"--proxy-server={proxy_url}")
+        opts.add_argument("--proxy-bypass-list=<-loopback>")
+        opts.add_argument("--disable-quic")
+        opts.add_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-extensions")
+    opts.add_experimental_option("prefs", {"download_restrictions": 3,
+                                         "credentials_enable_service": False,
+                                         "profile.password_manager_enabled": False})
+    if chrome_binary or os.getenv("CHROME_BINARY"):
+        opts.binary_location = str(chrome_binary or os.environ["CHROME_BINARY"])
+    opts.page_load_strategy = page_load_strategy
+    executable = driver_path or os.getenv('CHROMEDRIVER_PATH')
+    service = Service(executable_path=str(executable) if executable else None,
+                      log_output=str(service_log) if service_log else None)
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(30)
     return driver
