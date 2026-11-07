@@ -9,7 +9,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..schema import JSONModel
+from ..schema import JSONModel, ORACLE_GUIDE, validate_oracle_binding
+from ..checked_selenium import EVIDENCE_GUIDE
 
 
 def find_locators(snapshot: dict[str, Any]) -> dict[str, list[str]]:
@@ -76,11 +77,12 @@ followed by trusted observation. Evidence by supports css/xpath/id/name, exactly
 same locator capabilities as operations. selector must be an ACTUAL locator string,
 never a locator type such as "CSS" or "XPATH". Do not add an xpath field: use by="xpath"
 and selector="//input[@id='choice']". Omitting by preserves legacy CSS bindings.
-Evidence reads: texts (visible text list), text (one visible element), count (visible
+Evidence reads: selected_text (selected option's display label, target native select),
+texts (visible text list), text (one visible element), count (visible
 match count), selected (native is_selected), visible (native is_displayed), enabled
 (native is_enabled), attribute (also requires attribute, e.g. "class" or "aria-checked").
 Scalar reads require exactly one existing element; missing/ambiguous is unknown, NOT
-false. selected works for opacity-styled native checkboxes even if invisible. Target
+false (except collection existence reads). selected works for opacity-styled native checkboxes even if invisible. Target
 the SPECIFIED item's checkbox, independent of its current state; never a selector that
 only matches checked/completed items to infer false from absence. Use specific
 list item label selector for texts, not container text concatenating other UI labels.
@@ -95,6 +97,12 @@ Use only the listed EC predicates. Every step must be self-contained; variables 
 persist across steps. For native completion state use read="selected" on the item's
 checkbox; for custom widgets use an attribute of the specific item. Expected business
 values are compared later by Agent5, never put assert/expected values into bindings.'''
+        system += '''\nA requested dropdown choice is an action, not an assumed default.
+Use native option.click() on the option identified from current DOM; Select is not
+an injected capability. Follow the reviewed choice even if the initial value differs.
+Evidence must match the Oracle type; local variables like result=[...] do NOT become
+trusted measurements. Do not turn numeric counts into booleans yourself.'''
+        system += '\n' + ORACLE_GUIDE + '\n' + EVIDENCE_GUIDE
         previous_proposal = previous if isinstance(previous, dict) else {'code': previous, 'bindings': {}}
         payload = dict(contract=contract, current_step=step, untrusted_page=observation,
                        previous_code=previous_proposal.get('code'),
@@ -109,7 +117,38 @@ values are compared later by Agent5, never put assert/expected values into bindi
             raise ValueError(f'Step {step["id"]} code: {exc}') from exc
         expected = {o['id'] for o in contract['oracles'] if o['step_id'] == step['id']}
         data['bindings'] = normalize_bindings(data.get('bindings', {}), step_id=step['id'], expected_ids=expected)
+        for oracle in contract['oracles']:
+            if oracle['id'] in data['bindings']:
+                validate_oracle_binding(oracle, data['bindings'][oracle['id']])
         return data
+
+    def repair_bindings(self, contract, step, observation, *, llm, previous, error, proposal_path=None):
+        """Repair evidence only, using a saved checkpoint; never replace working code."""
+        system = '''You are Agent3 repairing ONLY evidence bindings after Agent2 review.
+The Selenium code has already executed successfully and MUST remain unchanged.
+Return JSON {"bindings":{"O1":{"by":"id","selector":"choice","read":"selected_text","step_id":"S1"}},"reason":"..."}.
+Return all and only Oracles attached to the current step. No code, expected values or
+semantic plan changes. The untrusted_page is the SAVED observation immediately after
+this step, not the current browser. Use it to repair bindings for that checkpoint.
+Final cold-start replay will validate the corrected bindings against the real DOM.
+Follow the original object and Oracle exactly. For a dropdown LABEL use selected_text
+on the native select; selected_value is unsupported. Do not assume final-page DOM is
+the earlier checkpoint. selector must be an actual locator, never "CSS" or "XPATH".'''
+        system += '\n' + ORACLE_GUIDE + '\n' + EVIDENCE_GUIDE
+        data = llm.complete_json(system, json.dumps(dict(contract=contract,current_step=step,
+            untrusted_page=observation,previous_code=previous['code'],
+            previous_bindings=previous['bindings'],actual_error=error),ensure_ascii=False))
+        if proposal_path:
+            proposal_path.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+        if not isinstance(data, dict) or set(data) - {'bindings', 'reason'}:
+            raise ValueError(f'Step {step["id"]}: binding-only repair accepts bindings/reason, never code or expectations')
+        from ..checked_selenium import normalize_bindings
+        expected = {o['id'] for o in contract['oracles'] if o['step_id'] == step['id']}
+        fixed = normalize_bindings(data.get('bindings'),step_id=step['id'],expected_ids=expected)
+        for oracle in contract['oracles']:
+            if oracle['id'] in fixed:
+                validate_oracle_binding(oracle,fixed[oracle['id']])
+        return fixed
 
     @staticmethod
     def freeze_dynamic(steps, *, run_dir):

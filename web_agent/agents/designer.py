@@ -11,7 +11,7 @@ import json
 import re
 from typing import Any
 
-from ..schema import JSONModel, QuerySpec
+from ..schema import JSONModel, QuerySpec, ORACLE_GUIDE
 
 
 class Agent1TestDesigner:
@@ -20,19 +20,35 @@ class Agent1TestDesigner:
     def design_dynamic(self, requirement, *, url, llm, feedback=None):
         system = '''You are Agent1, a Web GUI test designer. Turn the original requirement into
 semantic ordered actions and explicit test expectations. No Selenium, selectors or HTML.
+Do not include read/by/selector/attribute execution hints in semantic Oracles.
 Return JSON {"steps":[{"id":"S1","goal":"..."}],
-"oracles":[{"id":"O1","step_id":"S4","meaning":"...","kind":"equals|contains|set_equals",
-"expected": any JSON literal}],"preconditions":["..."],"missing_inputs":[]}.
+"oracles":[{"id":"O1","step_id":"S4","meaning":"...","kind":"gte",
+"expected":1,"source_quote":"exact excerpt of original requirement"}],
+"preconditions":["..."],"missing_inputs":[]}.
 Use 1..12 actions with sequential IDs. The browser ALREADY starts at the supplied URL;
 do not add an initial navigation action. Split interactions into individual steps,
 especially clicks causing navigation/dynamic updates. Expected values MUST reflect user
 data; never invent business success. For only unfinished items, expected list must contain
 only the unfinished item, and also check completed item remains completed before filtering.
+Do NOT assume webpage defaults or literal headings/messages before observing DOM.
+When a user specifies a choice, plan to ACTIVELY SELECT it, even if they say "keep"
+that value; its default is unknown. An unspecified default must remain unspecified.
+Do not add mandatory exact text/heading expectations unless that text comes from the
+original requirement. Page-load waits are technical implementation, not invented business
+Oracles. Every Oracle must cite source_quote from the user and test a requested fact;
+derived numeric thresholds such as "at least one" => gte 1 are allowed.
 Oracles are DOM-readable facts and are attached to the step where they can be observed.
 No URLs outside the authorized origin, logins, downloads or destructive remote effects.'''
+        system += '\n' + ORACLE_GUIDE
         data = llm.complete_json(system, json.dumps(dict(requirement=requirement, start_url=url,
                                                          review_feedback=feedback or []), ensure_ascii=False))
         from ..schema import validate_dynamic_plan
+        data = dict(data, requirement=requirement)
+        # Execution hints are not frozen semantic expectations. Agent3 chooses them
+        # after DOM observation, using the actual Runtime capability contract.
+        for oracle in data.get('oracles', []):
+            for key in ('read', 'by', 'selector', 'attribute'):
+                oracle.pop(key, None)
         validate_dynamic_plan(data)
         return dict(data, requirement=requirement, start_url=url, interpretation_mode='real_llm')
 

@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 import uuid
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from bs4 import BeautifulSoup, Comment
 from .selenium_runtime import make_driver
 
@@ -38,6 +38,32 @@ def safe_href(value: str) -> str:
         fragment = urlsplit(value).fragment
         route = '#' + fragment if re.fullmatch(r'/[A-Za-z0-9/_-]{0,100}', fragment) else ''
         return safe_url(value) + route
+    except ValueError:
+        return '[invalid URL]'
+
+
+def diagnostic_url(value: str) -> str:
+    """Keep public search/paging state; redact other values and credentials.
+
+    Link summaries still use safe_href. Unknown query state is distinguished by a
+    digest without revealing its value. This is diagnostic data, not a navigation URL.
+    """
+    try:
+        p = urlsplit(value)
+        if len(p.query) > 8000:
+            return safe_href(value) + '?query=[too long]'
+        public = re.compile(r'(?:.*[-_])?(?:q|query|search|searchtype|page|start|size|order|sort|term|field|operator)$', re.I)
+        pairs, redacted = [], False
+        for key, text in parse_qsl(p.query, keep_blank_values=True, max_num_fields=100):
+            if public.fullmatch(key) and not SENSITIVE.search(key) and not SENSITIVE.search(text):
+                pairs.append((key[:80], safe_text(text, 160)))
+            else:
+                pairs.append((key[:80] if not SENSITIVE.search(key) else 'redacted', '[REDACTED]'))
+                redacted = True
+        if redacted:
+            pairs.append(('query_digest', hashlib.sha256(p.query.encode()).hexdigest()[:12]))
+        route = '#' + p.fragment if re.fullmatch(r'/[A-Za-z0-9/_-]{0,100}', p.fragment) else ''
+        return safe_url(value) + ('?' + urlencode(pairs) if pairs else '') + route
     except ValueError:
         return '[invalid URL]'
 
@@ -153,7 +179,7 @@ def observe_session(driver, *, region_css: str | None = None, max_elements: int 
             snapshot['truncated'] = True
         if len(live) >= max_elements:
             break
-    snapshot.update(url=safe_href(driver.current_url), title=safe_text(driver.title, 140),
+    snapshot.update(url=diagnostic_url(driver.current_url), title=safe_text(driver.title, 140),
                     current_window=driver.current_window_handle, windows=list(driver.window_handles),
                     frame_context='top' if driver.execute_script('return window === window.top') else 'unsupported',
                     ready_state=driver.execute_script('return document.readyState'), live_elements=live,

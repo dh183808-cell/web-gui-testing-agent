@@ -30,7 +30,21 @@ OBSERVED_ATTRIBUTES = frozenset({'id', 'name', 'type', 'value', 'class', 'href',
     'data-testid', 'disabled', 'selected', 'role', 'placeholder'})
 LOCATORS = {'css': 'css selector', 'css selector': 'css selector', 'css_selector': 'css selector',
             'xpath': 'xpath', 'id': 'id', 'name': 'name'}
-READS = {'count', 'text', 'texts', 'selected', 'visible', 'enabled', 'attribute'}
+READS = {'count', 'text', 'texts', 'selected', 'selected_text', 'visible', 'enabled', 'attribute', 'exists', 'visible_exists'}
+EVIDENCE_GUIDE = '''Trusted Runtime evidence semantics (not model Python return values):
+by supports css/xpath/id/name. count returns an INTEGER of VISIBLE matched elements
+(is_displayed filtered); texts returns their visible text list. Neither counts hidden
+nodes. exists returns a BOOLEAN for any DOM match (including hidden nodes);
+visible_exists returns a BOOLEAN for any visible match. Empty collections yield
+count=0, texts=[], exists=false, visible_exists=false. selected/visible/enabled read
+the native state of exactly ONE existing target; missing/ambiguous targets are UNKNOWN,
+not false. text reads one visible target; attribute reads an allowed attribute string.
+selected_text reads the displayed label of the selected option of ONE native select,
+e.g. value="all" with label "All fields" returns "All fields", not "all".
+Missing/hidden select or missing/ambiguous selected options are UNKNOWN. Target the
+select itself. selected_value is NOT supported. attribute(value) is the internal value;
+text on a specific selected option is also supported for its label.
+No implicit count-to-bool or string-to-number conversion. At most 200 matches.'''
 
 
 def normalize_bindings(bindings, *, step_id=None, expected_ids=None):
@@ -91,6 +105,10 @@ def collect_measurements(driver, base_url, bindings, *, step_id=None):
             kind, value, status = query['read'], None, 'observed'
             if kind == 'count':
                 value = len(visible)
+            elif kind == 'exists':
+                value = bool(nodes)
+            elif kind == 'visible_exists':
+                value = bool(visible)
             elif kind == 'texts':
                 value = [safe_text(n.text, 500) for n in visible]
             elif len(nodes) != 1:
@@ -98,6 +116,21 @@ def collect_measurements(driver, base_url, bindings, *, step_id=None):
             elif kind == 'text':
                 value = safe_text(wrapped[0].text, 1000) if visible else None
                 status = 'observed' if visible else 'hidden'
+            elif kind == 'selected_text':
+                if nodes[0].tag_name.lower() != 'select':
+                    raise ValueError('selected_text requires a native select target; use text for an option')
+                if not visible:
+                    status = 'hidden'
+                else:
+                    from selenium.webdriver.common.by import By
+                    options = nodes[0].find_elements(By.TAG_NAME, 'option')
+                    if len(options) > 200:
+                        raise ValueError('selected_text supports at most 200 options')
+                    selected = [n for n in options if n.is_selected()]
+                    if len(selected) != 1:
+                        status = 'selection_missing' if not selected else 'selection_ambiguous'
+                    else:
+                        value = safe_text(Element(selected[0], Browser(driver, base_url)).text, 1000)
             elif kind in {'selected', 'visible', 'enabled'}:
                 method = {'selected': 'is_selected', 'visible': 'is_displayed', 'enabled': 'is_enabled'}[kind]
                 value = getattr(wrapped[0], method)()
@@ -107,7 +140,7 @@ def collect_measurements(driver, base_url, bindings, *, step_id=None):
                 if raw is None:
                     status = 'attribute_missing'
             result[key] = dict(query, value=value, status=status, matched=len(nodes), visible=len(visible),
-                               visible_only=kind in {'count', 'text', 'texts'})
+                               visible_only=kind in {'count', 'text', 'texts', 'visible_exists'})
         except Exception as exc:
             raise ValueError(f'Step {query["step_id"]} Oracle {key}: {type(exc).__name__}: '
                              + safe_text(str(exc).splitlines()[0], 600)) from exc
@@ -183,8 +216,39 @@ def validate_source(source):
 
 
 class Browser:
-    def __init__(self, driver, base_url):
+    def __init__(self, driver, base_url, *, actions=None, on_action=None):
         self._driver, self._origin = driver, origin(base_url)
+        self._actions, self._on_action = actions, on_action
+
+    def _url(self):
+        from .dom_inspector import diagnostic_url
+        try:
+            return diagnostic_url(self._driver.current_url)
+        except Exception:
+            return '[unavailable]'
+
+    def _action(self, action, target, fn):
+        if self._actions is None:
+            return fn()
+        from .dom_inspector import safe_text
+        record = dict(action=action,target=safe_text(target,300),before_url=self._url(),status='started')
+        if len(self._actions) >= 200:
+            raise ValueError('Action log limit exceeded (200)')
+        self._actions.append(record)
+        if self._on_action:
+            self._on_action(dict(record))
+        try:
+            result = fn()
+            record['status'] = 'complete'
+            return result
+        except Exception as exc:
+            record.update(status='error',error_type=type(exc).__name__)
+            raise
+        finally:
+            record['after_url'] = self._url()
+            record['navigated'] = record['before_url'] != record['after_url']
+            if self._on_action:
+                self._on_action(dict(record))
 
     def _check_url(self, url):
         if origin(url) != self._origin:
@@ -192,14 +256,15 @@ class Browser:
 
     def get(self, url):
         self._check_url(url)
-        self._driver.get(url)
+        from .dom_inspector import diagnostic_url
+        self._action('get',diagnostic_url(url),lambda: self._driver.get(url))
         self._check_url(self._driver.current_url)
 
     def find_element(self, by, value):
-        return Element(self._driver.find_element(by, value), self)
+        return Element(self._driver.find_element(by, value), self, target=f'{by}: {value}')
 
     def find_elements(self, by, value):
-        return [Element(e, self) for e in self._driver.find_elements(by, value)[:200]]
+        return [Element(e, self, target=f'{by}: {value}') for e in self._driver.find_elements(by, value)[:200]]
 
     @property
     def title(self):
@@ -211,8 +276,9 @@ class Browser:
 
 
 class Element:
-    def __init__(self, element, browser):
+    def __init__(self, element, browser, *, target='element'):
         self._element, self._browser = element, browser
+        self._target = target
         identity = ' '.join(element.get_attribute(k) or '' for k in ('type', 'name', 'id', 'autocomplete'))
         if re.search(r'password|passwd|secret|token|api.?key|credit.?card', identity, re.I):
             raise PermissionError('Sensitive controls are outside this demo')
@@ -221,16 +287,17 @@ class Element:
         href = self._element.get_attribute('href')
         if href:
             self._browser._check_url(href)
-        self._element.click()
+        self._browser._action('click',self._target,self._element.click)
         self._browser._check_url(self._browser.current_url)
 
     def clear(self):
-        self._element.clear()
+        self._browser._action('clear',self._target,self._element.clear)
 
     def send_keys(self, *values):
         if not values or sum(len(str(v)) for v in values) > 2000:
             raise ValueError('Input exceeds the research demo limit')
-        self._element.send_keys(*values)
+        # Log the action and locator, never input text/credentials.
+        self._browser._action('send_keys',self._target,lambda: self._element.send_keys(*values))
 
     def get_attribute(self, name):
         if name not in OBSERVED_ATTRIBUTES:
@@ -251,20 +318,21 @@ class Element:
         return self._element.is_selected()
 
     def find_element(self, by, value):
-        return Element(self._element.find_element(by, value), self._browser)
+        return Element(self._element.find_element(by, value), self._browser,target=f'{self._target} > {by}: {value}')
 
     def find_elements(self, by, value):
-        return [Element(e, self._browser) for e in self._element.find_elements(by, value)[:200]]
+        return [Element(e, self._browser,target=f'{self._target} > {by}: {value}')
+                for e in self._element.find_elements(by, value)[:200]]
 
 
-def execute_source(source, driver, base_url):
+def execute_source(source, driver, base_url, *, actions=None, on_action=None):
     """Interpret a finite Selenium subset; no model Python bytecode execution."""
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
     tree = validate_source(source)
-    browser = Browser(driver, base_url)
+    browser = Browser(driver, base_url,actions=actions,on_action=on_action)
 
     def wait(target, timeout=10, poll_frequency=.2):
         if target is not browser or not isinstance(timeout, (int, float)) or not .1 <= timeout <= 20:

@@ -278,13 +278,20 @@ def test_real_chrome_xpath_states_len_and_independent_replay():
 if len(nodes) == 1 and not nodes[0].is_selected():
     nodes[0].click()
 names = [e.get_attribute("id") for e in nodes if e.is_enabled()]
-driver.find_element(By.ID, "terms-0-term").send_keys(len(names))'''
+driver.find_element(By.ID, "terms-0-term").send_keys(len(names))
+driver.find_element(By.XPATH, "//select[@id='terms-0-field']/option[normalize-space(.)='Title']").click()
+driver.find_element(By.XPATH, "//select[@id='terms-0-field']/option[normalize-space(.)='All fields']").click()'''
     queries = {
         'O1':dict(by='xpath',selector="//label[contains(.,'Computer Science')]/input",read='selected',step_id='S1'),
         'O2':dict(by='id',selector='terms-0-term',read='attribute',attribute='value',step_id='S1'),
         'O3':dict(by='name',selector='classification-computer_science',read='count',step_id='S1'),
         'O4':dict(selector='#terms-0-field',read='enabled',step_id='S1'),
         'O5':dict(by='xpath',selector='//input[@id="missing"]',read='selected',step_id='S1'),
+        'O6':dict(selector='#terms-0-field',read='visible_exists',step_id='S1'),
+        'O7':dict(selector='#missing',read='exists',step_id='S1'),
+        'O8':dict(selector='#terms-0-field option:checked',read='text',step_id='S1'),
+        'O9':dict(by='id',selector='terms-0-field',read='selected_text',step_id='S1'),
+        'O10':dict(selector='#terms-0-field',read='attribute',attribute='value',step_id='S1'),
     }
     sessions, results, cleanup = [], [], []
     try:
@@ -297,8 +304,18 @@ driver.find_element(By.ID, "terms-0-term").send_keys(len(names))'''
                 result = session.execute_checked(code,step_id='S1',queries=queries)
                 results.append(result)
                 assert result['status']=='COMPLETE', result
-                assert [result['measurements'][k]['value'] for k in queries] == [True,'1',1,True,None]
+                assert [result['measurements'][k]['value'] for k in list(queries)[:5]] == [True,'1',1,True,None]
                 assert result['measurements']['O5']['status']=='missing'
+                assert [result['measurements'][k]['value'] for k in ('O6','O7','O8','O9','O10')]==[True,False,'All fields','All fields','all']
+                assert [a['action'] for a in result['actions']]==['click','send_keys','click','click']
+                assert (session.run_dir/'browser_actions.jsonl').exists()
+                contract={'oracles':[dict(id='O3',step_id='S1',kind='gte',expected=1,meaning='at least one'),
+                    dict(id='O6',step_id='S1',kind='equals',expected=True,meaning='visible select exists'),
+                    dict(id='O7',step_id='S1',kind='equals',expected=False,meaning='missing node'),
+                    dict(id='O8',step_id='S1',kind='equals',expected='All fields',meaning='requested selection'),
+                    dict(id='O9',step_id='S1',kind='equals',expected='All fields',meaning='selected display label')]}
+                assert Agent5EvidenceVerifier().verify_dynamic(contract,dict(execution_status='COMPLETE',
+                    measurements=result['measurements'])).status=='PASS'
                 cleanup.append(session.close_session())
         assert sessions[0].metadata['browser_session_id'] != sessions[1].metadata['browser_session_id']
         assert sessions[0].run_dir != sessions[1].run_dir

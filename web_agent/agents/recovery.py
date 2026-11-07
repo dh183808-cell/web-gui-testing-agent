@@ -32,6 +32,7 @@ class Agent6RecoveryController:
         return dict(stage=stage, execution_status='ERROR', repairs_used=repairs,
                     error_type=result.get('error_type'), failed_step=result.get('step_id'),
                     observation_ref=result.get('observation_ref'),
+                    issues=result.get('issues', []), issue_type=result.get('issue_type'),
                     decision='STOP', reason='Technical execution or budget blocked; no business verdict',
                     suggestions=['Inspect latest DOM and execution error', 'Check authorized origin and page availability'])
 

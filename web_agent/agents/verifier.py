@@ -9,11 +9,12 @@ The pipeline owns probe authorization, budget, execution and evidence merging.
 from __future__ import annotations
 
 import re
+import operator
 from typing import Any
 
 from ..evidence_plan import get_path
 from ..probe_plan import make_probe_request
-from ..schema import Verdict
+from ..schema import Verdict, NUMERIC_ORACLES, finite_number, validate_oracle_binding
 
 
 class Agent5EvidenceVerifier:
@@ -27,6 +28,11 @@ class Agent5EvidenceVerifier:
             measurement = evidence.get('measurements', {}).get(oracle['id'], {})
             actual = measurement.get('value')
             expected = oracle['expected']
+            if measurement.get('read'):
+                try:
+                    validate_oracle_binding(oracle, measurement)
+                except ValueError as exc:
+                    return Verdict(status='ERROR',message='Formal evidence binding type error: '+str(exc))
             if (actual is None or measurement.get('status', 'observed') != 'observed'
                     or not measurement.get('observation_ref') or not measurement.get('screenshot_ref')
                     or measurement.get('step_id', oracle.get('step_id')) != oracle.get('step_id')):
@@ -35,6 +41,9 @@ class Agent5EvidenceVerifier:
                 passed = type(actual) is type(expected) and actual == expected
             elif oracle['kind'] == 'set_equals':
                 passed = isinstance(actual,list) and isinstance(expected,list) and sorted(actual)==sorted(expected)
+            elif oracle['kind'] in NUMERIC_ORACLES:
+                passed = (finite_number(actual) and finite_number(expected)
+                          and {'gte':operator.ge,'gt':operator.gt,'lte':operator.le,'lt':operator.lt}[oracle['kind']](actual,expected))
             else:
                 passed = expected in actual if isinstance(actual,(str,list)) else False
             checks.append(dict(oracle_id=oracle['id'], meaning=oracle['meaning'], expected=expected,

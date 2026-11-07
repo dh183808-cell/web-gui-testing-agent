@@ -246,6 +246,8 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
     sessions, events, reviews = [], [], []
     repairs, calls_start = 0, 0
     attempts = {}
+    review_revisions = {'planning': 0, 'implementation': 0}
+    requirement_id = uuid.uuid4().hex
     stage, contract = 'Agent1', {}
     started = time.monotonic()
 
@@ -257,11 +259,21 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         write('events.json', events)
         print(agent + ': ' + action, flush=True)
 
-    def session(purpose):
+    def session(purpose, reason):
+        event('Runtime','session_starting',purpose=purpose,reason=reason)
         s = create_session(run_dir, purpose=purpose, start_url=url, research_mode=True,
                            limits=limits, headless=headless)
         sessions.append(s)
+        event('Runtime','session_created',purpose=purpose,reason=reason,
+              session_id=getattr(s,'session_id',None),
+              browser_session_id=getattr(s,'metadata',{}).get('browser_session_id'))
         return s
+
+    def close(s, reason):
+        cleanup = s.close_session()
+        event('Runtime','session_closed',reason=reason,session_id=getattr(s,'session_id',None),
+              cleanup=cleanup)
+        return cleanup
 
     def observe(s):
         view = dict(s.observe(max_elements=80, max_html=16000))
@@ -279,40 +291,60 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         write('final_verdict.json', verdict)
         return dict(verdict=verdict, run_dir=str(run_dir), report=str(run_dir/'report.md'))
 
-    try:
-        if llm is None:
-            from .llm_adapter import StructuredLLM
-            llm = StructuredLLM(provider=provider or 'deepseek', model=model)
-        calls_start = len(getattr(llm,'calls',[]))
-        feedback = []
-        for revision in range(2):
+    def plan(feedback=None):
+        """One planning revision across initial review AND later semantic feedback."""
+        nonlocal stage
+        feedback = feedback or []
+        while True:
+            stage = 'Agent1'
+            revision = review_revisions['planning'] + 1
             draft = Agent1TestDesigner().design_dynamic(requirement, url=url, llm=llm, feedback=feedback)
-            write('agent1_draft_' + str(revision+1) + '.json', draft)
+            write('agent1_draft_' + str(revision) + '.json', draft)
             event('Agent1','semantic_plan_created', steps=len(draft['steps']))
             stage = 'Agent2'
             decision = Agent2TestReviewer().review_dynamic(draft, llm=llm)
             reviews.append(decision)
             write('agent2_reviews.json',reviews)
             if decision['approved'] and not draft.get('missing_inputs'):
-                contract = dict(draft, revision=revision+1, requirement_id=uuid.uuid4().hex)
-                validate_dynamic_plan(contract)
-                break
+                approved = dict(draft, revision=revision, requirement_id=requirement_id)
+                validate_dynamic_plan(approved)
+                return approved
+            if review_revisions['planning'] >= 1:
+                return {}
+            review_revisions['planning'] += 1
+            write('review_revisions.json', review_revisions)
             feedback = decision.get('issues',[]) + draft.get('missing_inputs',[])
+
+    def freeze_contract(approved):
+        digest = hashlib.sha256(json.dumps(approved,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+        write('test_contract.json',approved)
+        write('test_contract_r'+str(approved['revision'])+'.json',approved)
+        event('Agent2','contract_frozen', contract_sha256=digest, revision=approved['revision'])
+        return digest
+
+    try:
+        if llm is None:
+            from .llm_adapter import StructuredLLM
+            llm = StructuredLLM(provider=provider or 'deepseek', model=model)
+        calls_start = len(getattr(llm,'calls',[]))
+        contract = plan()
         if not contract:
-            return fail('Agent2', {'error_type':'ReviewRejected'})
-        contract_hash = hashlib.sha256(json.dumps(contract,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
-        write('test_contract.json',contract)
-        event('Agent2','contract_frozen', contract_sha256=contract_hash)
+            return fail('Agent2', {'error_type':'ReviewRejected','issues':reviews[-1].get('issues',[])})
+        contract_hash = freeze_contract(contract)
         stage = 'Agent3'
         generator = Agent3SeleniumGenerator()
-        trial = session('trial')
+        trial = session('trial','incremental_development')
         observation = observe(trial)
         implementation, bindings, debug = [], {}, []
+        checkpoints = {}
         cold_error = None
+        review_feedback = {}
         while True:
+            stage = 'Agent3'
             for index in range(len(implementation), len(contract['steps'])):
                 step = contract['steps'][index]
-                previous, error = (cold_error or {}).get('previous_proposal'), cold_error
+                error = review_feedback.pop(step['id'], None) or cold_error
+                previous = (error or {}).get('previous_proposal')
                 cold_error = None
                 while True:
                     attempts[step['id']] = attempts.get(step['id'],0)+1
@@ -328,6 +360,9 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                         (run_dir/(name+'.py')).write_text(source,encoding='utf-8')
                         write(name+'.json',proposal)
                         result = trial.execute_checked(source,step_id=step['id'],queries=proposal['bindings'])
+                        event('Runtime','step_executed',step_id=step['id'],phase='development',
+                              status=result['status'],session_id=result.get('session_id'),
+                              current_url=result.get('current_url'),actions=result.get('actions',[]))
                     except (ValueError,SyntaxError) as exc:
                         # develop_step saves the raw proposal before validating it. Keep
                         # rejected code AND bindings available to the next repair call.
@@ -343,6 +378,7 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                         implementation.append(dict(id=step['id'],source=source))
                         bindings.update(proposal['bindings'])
                         observation = observe(trial)
+                        checkpoints[step['id']] = observation
                         event('Agent3','step_complete_observed',step_id=step['id'],
                               observation_ref=result.get('observation_ref'))
                         break
@@ -354,19 +390,92 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                     event('Agent3','repair_from_actual_error',step_id=step['id'],repairs=repairs,
                           error_type=result.get('error_type'))
             path, digest = generator.freeze_dynamic(implementation,run_dir=run_dir)
+            stage = 'Agent2Implementation'
             review = Agent2TestReviewer().review_implementation(contract,implementation,bindings,
-                                                                observation=observation,llm=llm)
+                                                                observation=observation,llm=llm,
+                                                                checkpoints=checkpoints)
             write('implementation_review_'+uuid.uuid4().hex[:6]+'.json',review)
             if not review['approved']:
-                return fail('Agent2Implementation',dict(error_type='ImplementationReviewRejected'))
-            trial.close_session()
-            cold = session('trial')
+                category = review['issue_type']
+                failure = dict(error_type='ImplementationReviewRejected',issue_type=category,
+                               issues=review['issues'],step_ids=review['step_ids'],
+                               repair_scope=review['repair_scope'])
+                if review_revisions[category] >= 1 or repairs >= task_repairs:
+                    return fail('Agent2Implementation',failure)
+                review_revisions[category] += 1
+                repairs += 1
+                write('review_revisions.json', review_revisions)
+                event('Agent2','review_feedback',issue_type=category,issues=review['issues'],repairs=repairs,
+                      repair_scope=review['repair_scope'])
+                if category == 'implementation' and review['repair_scope'] == 'bindings':
+                    # The saved post-step DOM is sufficient for a binding proposal.
+                    # Validate it on the mandatory cold replay; do not restart here,
+                    # regenerate a successful suffix, or let Agent3 edit semantics.
+                    affected = set(review['step_ids'])
+                    ids = {s['id'] for s in contract['steps']}
+                    if not affected or not affected <= ids:
+                        return fail('Agent2Implementation',dict(failure,error='Binding repair requires valid affected step IDs'))
+                    for step in contract['steps']:
+                        sid = step['id']
+                        if sid not in affected:
+                            continue
+                        attempts[sid] = attempts.get(sid,0)+1
+                        if attempts[sid] > step_attempts:
+                            return fail('Agent3BindingRepair',dict(failure,error_type='StepBudgetExhausted',step_id=sid))
+                        previous = dict(code=next(s['source'] for s in implementation if s['id']==sid),
+                                        bindings={k:v for k,v in bindings.items() if v['step_id']==sid})
+                        name = 'agent3_binding_repair_'+sid+'_'+uuid.uuid4().hex[:6]
+                        stage = 'Agent3BindingRepair'
+                        fixed = generator.repair_bindings(contract,step,checkpoints[sid],llm=llm,
+                            previous=previous,error=failure,proposal_path=run_dir/(name+'.json'))
+                        bindings.update(fixed)
+                        write(name+'_audit.json',dict(step_id=sid,previous=previous,bindings=fixed,
+                            script_sha256=digest,code_unchanged=True,checkpoint=checkpoints[sid],issues=review['issues']))
+                        event('Agent3','evidence_bindings_repaired',step_id=sid,script_sha256=digest,
+                              code_unchanged=True,browser_restarted=False)
+                    continue
+                close(trial,'semantic_revision' if category=='planning' else 'code_revision_prefix_replay')
+                if category == 'planning':
+                    # Only Agent1/2 may revise semantics, always against the original
+                    # user text. Preserve the old contract; never patch it in Agent3.
+                    contract = plan([dict(issues=review['issues'],previous_contract=contract,
+                                          untrusted_page=observation)])
+                    if not contract:
+                        return fail('Agent2',failure)
+                    contract_hash = freeze_contract(contract)
+                    implementation, bindings, review_feedback, checkpoints = [], {}, {}, {}
+                    trial = session('trial','semantic_revision')
+                    observation = observe(trial)
+                    continue
+                ids = [s['id'] for s in contract['steps']]
+                affected = [sid for sid in review['step_ids'] if sid in ids] or ids
+                first = min(ids.index(sid) for sid in affected)
+                # Restart and replay the accepted prefix, then regenerate the suffix
+                # with its original source/bindings plus the exact review feedback.
+                review_feedback = {s['id']:dict(failure,step_id=s['id'],previous_proposal=dict(
+                    code=s['source'],bindings={k:v for k,v in bindings.items() if v['step_id']==s['id']}))
+                    for s in implementation[first:]}
+                implementation = implementation[:first]
+                bindings = {k:v for k,v in bindings.items() if v['step_id'] in ids[:first]}
+                checkpoints = {k:v for k,v in checkpoints.items() if k in ids[:first]}
+                trial = session('trial','code_revision_prefix_replay')
+                if implementation:
+                    prefix = ''.join('# webagent-step: '+s['id']+'\n'+s['source']+'\n\n' for s in implementation)
+                    replay = trial.execute_program(prefix,step_ids=ids[:first],bindings=bindings)
+                    write('review_prefix_replay.json',replay)
+                    if replay['execution_status'] != 'COMPLETE':
+                        return fail('Agent3ReviewReplay',replay['steps'][-1])
+                observation = observe(trial)
+                continue
+            stage = 'Agent3'
+            close(trial,'mandatory_cold_trial')
+            cold = session('trial','mandatory_cold_trial')
             source = path.read_text(encoding='utf-8')
             replay = cold.execute_program(source,step_ids=[s['id'] for s in contract['steps']],bindings=bindings)
             write('agent3_cold_trial_'+uuid.uuid4().hex[:6]+'.json',replay)
             event('Agent3','cold_trial_finished',status=replay['execution_status'],script_sha256=digest)
             if replay['execution_status']=='COMPLETE':
-                cold.close_session()
+                close(cold,'cold_trial_finished')
                 break
             failed = replay['steps'][-1]
             if repairs >= task_repairs or failed['status']=='TIMEOUT':
@@ -384,14 +493,14 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                   repairs=repairs,error_type=failed.get('error_type'))
         delivery = dict(script_path=str(path),script_sha256=digest,contract_sha256=contract_hash,
                         cold_trial_complete=True,step_ids=[s['id'] for s in contract['steps']],
-                        bindings=bindings,repairs_used=repairs,attempts=attempts)
+                        bindings=bindings,repairs_used=repairs,attempts=attempts,review_revisions=review_revisions)
         write('agent3_delivery.json',delivery)
         stage = 'Agent4'
-        formal = session('formal')
+        formal = session('formal','independent_formal_replay')
         evidence = Agent4TestExecutor().execute_dynamic(delivery,session=formal)
         evidence.update(contract_sha256=contract_hash,formal_run_dir=str(formal.run_dir))
         write('formal_evidence.json',evidence)
-        cleanup = formal.close_session()
+        cleanup = close(formal,'formal_replay_finished')
         if evidence['execution_status']!='COMPLETE' or not cleanup['process_tree_terminated']:
             return fail('Agent4',evidence.get('steps',[{}])[-1])
         event('Agent4','same_source_replayed_independently',script_sha256=digest,
@@ -415,6 +524,7 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                 failed_final.update(status='ERROR',message='Owned browser cleanup was not confirmed')
                 write('final_verdict.json',failed_final)
         write('cleanup.json',cleanups)
+        write('review_revisions.json', review_revisions)
         write('llm_calls.json',getattr(llm,'calls',[])[calls_start:] if llm else [])
         final_path=run_dir/'final_verdict.json'
         final=json.loads(final_path.read_text(encoding='utf-8')) if final_path.exists() else {'status':'ERROR'}

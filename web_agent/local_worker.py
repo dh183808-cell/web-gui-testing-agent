@@ -13,7 +13,7 @@ import sys
 import time
 import traceback
 
-from .dom_inspector import observe_session, safe_text, safe_url
+from .dom_inspector import observe_session, safe_text, safe_url, diagnostic_url
 from .fixture_server import runtime_fixture
 from .selenium_runtime import make_driver, reviewed_script, TRUSTED_SCRIPT_IDS
 
@@ -42,10 +42,15 @@ def main():
     def checked(request):
         from .checked_selenium import execute_source, collect_measurements, normalize_bindings
         started = time.monotonic()
-        result = dict(status='ERROR', measurements={})
+        result = dict(status='ERROR', measurements={}, actions=[])
+        def record_action(action):
+            with (run_dir/'browser_actions.jsonl').open('a',encoding='utf-8') as trace:
+                trace.write(json.dumps(dict(step_id=request.get('step_id'),
+                    browser_session_id=driver.session_id,**action),ensure_ascii=True)+'\n')
         try:
+            result['before_url'] = diagnostic_url(driver.current_url)
             queries = normalize_bindings(request.get('queries', {}), step_id=request.get('step_id'))
-            execute_source(request['source'], driver, base_url)
+            execute_source(request['source'], driver, base_url,actions=result['actions'],on_action=record_action)
             result['measurements'] = collect_measurements(driver, base_url, queries, step_id=request.get('step_id'))
             result['status'] = 'COMPLETE'
         except Exception as exc:
@@ -57,6 +62,8 @@ def main():
             driver.save_screenshot(str(run_dir / name))
             observation['screenshot_ref'] = name
             result.update(observation=observation, screenshot_ref=name)
+            result.update(after_url=observation['url'],
+                          navigated=result.get('before_url') != observation['url'])
             for m in result['measurements'].values():
                 m['observation_ref'] = observation['observation_ref']
                 m['screenshot_ref'] = name
