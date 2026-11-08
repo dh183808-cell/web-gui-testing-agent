@@ -38,6 +38,10 @@ class Node:
 
 class Driver:
     title = 'Synthetic phase fixture'
+    current_window_handle, window_handles = 'source', ['source']
+    def execute_script(self, script, *args):
+        assert 'getAttribute(\'target\')' in script
+        return dict(href='', target='')
     def __init__(self, page='form', allow_bad_wait=False):
         self.page, self.value, self.current_url = page, '', BASE + page
         self.allow_bad_wait = allow_bad_wait

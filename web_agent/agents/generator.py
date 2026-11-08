@@ -69,7 +69,7 @@ Allowed injected names: driver, BASE_URL, By, Keys, EC, WebDriverWait, len.
 Allowed Python: expressions/assignments, literals, lists/tuples, result[0], len(),
 comparisons, and/or/not, if, for over a bounded list, single-generator list comprehensions
 with filters. Lists support append; strings support strip/lower. At most 200 elements
-and 5000 interpreted operations. No imports, functions, while, lambda, assert, print, eval/exec,
+and 5000 interpreted operations. No break/continue, try/except, imports, functions, while, lambda, assert, print, eval/exec,
 filesystem, subprocess, network client or driver.execute_script. No made-up values.
 Available Selenium: driver.get(same-origin literal URL), find_element(s), element
 click/clear/send_keys, text, get_attribute, is_displayed/enabled/selected;
@@ -80,7 +80,20 @@ invisibility_of_element_located/text_to_be_present_in_element. Maximum wait 20 s
 Wait ONLY for technical page/control state, never expected business equality. Business
 mismatch must be measured, not repaired by changing goal/expected or repeated actions.
 Use explicit waits before interactions and after navigation/AJAX. Every action is
-followed by trusted observation. Evidence by supports css/xpath/id/name, exactly the
+followed by trusted observation. Trusted click() and send_keys(Keys.ENTER) activations follow ONE newly opened
+same-origin window, including a briefly blank window; explicit new targets wait up to
+2 sec within the script budget. Ordinary clicks have no fixed window wait. For delayed
+JavaScript popups use an explicit EC wait for a destination-only element: driver
+reads/EC polls also detect and follow the new window. A generic heading/container
+already present on the entry page is NOT a navigation checkpoint. Wait for a
+destination-specific technical element grounded in the target link/current DOM.
+Runtime reports NavigationStateError for an unresolved link navigation or an
+unselected new window; use the recorded requested_url, window state and actual
+error to repair the technical wait/activation, never frozen business expectations.
+Do not add driver.get to work
+around a new tab. Multiple new windows, cross-origin targets, selecting an old window
+and browser back are unsupported. Always use destination DOM after a window switch.
+Evidence by supports css/xpath/id/name, exactly the
 same locator capabilities as operations. selector must be an ACTUAL locator string,
 never a locator type such as "CSS" or "XPATH". Do not add an xpath field: use by="xpath"
 and selector="//input[@id='choice']". Omitting by preserves legacy CSS bindings.
@@ -93,6 +106,19 @@ false (except collection existence reads). selected works for opacity-styled nat
 the SPECIFIED item's checkbox, independent of its current state; never a selector that
 only matches checked/completed items to infer false from absence. Use specific
 list item label selector for texts, not container text concatenating other UI labels.
+For an Oracle about ARTICLE/BODY content, read="text" on the complete relevant
+content region shown in content_regions/DOM. A list of child link labels does NOT
+measure the article's prose. Text evidence is complete and supports long bodies;
+do not narrow its scope merely to find expected words. Focused DOM summaries may
+include late-page links; use their actual href/class/text rather than guessing.
+href_path is SANITIZED, may be resolved/encoded and omits query values. Do NOT copy
+it into an exact href equality selector. Prefer observed text/classes or a stable
+href substring. A #fragment is a section link on the SAME document, not a link to
+another article. text_matches may show plain prose mentions with no link semantics;
+do not invent anchors/URLs for them or click an unrelated directory item as navigation.
+Clicks retain native hit testing and scroll distant elements into view. If blocked,
+inspect the recorded click_diagnostic and consider a supported keyboard activation
+for an actual link; never bypass overlays with JavaScript clicks.
 When fixing a failed step, inspect latest DOM and the actual error; avoid duplicating
 successful writes. On read/check-only step use driver.title as a valid no-op statement.
 Do not navigate backwards as generic recovery. No website-specific templates exist.'''

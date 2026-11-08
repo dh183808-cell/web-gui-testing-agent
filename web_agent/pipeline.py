@@ -276,8 +276,10 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         return cleanup
 
     def observe(s, saved_ref=None):
+        import re
+        focus = re.findall(r'["“「]([^"”」]{2,80})["”」]', requirement)
         view = (json.loads((s.run_dir / saved_ref).read_text(encoding='utf-8')) if saved_ref
-                else dict(s.observe(max_elements=80, max_html=16000)))
+                else dict(s.observe(max_elements=80, max_html=16000, focus_terms=focus)))
         ref = view.get('html_ref')
         if ref:
             view['html_summary'] = (s.run_dir / ref).read_text(encoding='utf-8')[:16000]

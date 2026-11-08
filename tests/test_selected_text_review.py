@@ -201,7 +201,9 @@ def test_actual_actions_include_navigation_and_failure_without_input_values():
         def send_keys(self,*args): pass
         def click(self): driver.current_url='https://authorized.test/search/?query=quantum'
         def clear(self): raise RuntimeError('synthetic control failure')
-    driver=SimpleNamespace(current_url='https://authorized.test/',find_element=lambda *a:Node())
+    driver=SimpleNamespace(current_url='https://authorized.test/',find_element=lambda *a:Node(),
+        current_window_handle='source',window_handles=['source'],
+        execute_script=lambda *a:dict(href='',target=''))
     actions,events=[],[]
     with pytest.raises(RuntimeError):
         execute_source('x=driver.find_element(By.ID,"choice")\nx.send_keys("synthetic-input")\nx.click()\nx.clear()',

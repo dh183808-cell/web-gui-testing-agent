@@ -35,10 +35,11 @@ def safe_url(value: str) -> str:
 
 
 def safe_href(value: str) -> str:
-    """Keep plain SPA paths consistently in HTML and structured observations."""
+    """Keep non-secret SPA routes AND document anchors in link observations."""
     try:
         fragment = urlsplit(value).fragment
-        route = '#' + fragment if re.fullmatch(r'/[A-Za-z0-9/_-]{0,100}', fragment) else ''
+        route = '#' + fragment if (re.fullmatch(r'(?:/[A-Za-z0-9/_-]{0,100}|[A-Za-z0-9_-]{1,80})', fragment)
+                                    and not SENSITIVE.search(fragment)) else ''
         return safe_url(value) + route
     except ValueError:
         return '[invalid URL]'
@@ -95,7 +96,7 @@ def _soup(html):
         for key in list(tag.attrs):
             if key not in {'id', 'class', 'name', 'type', 'role', 'aria-label', 'aria-checked',
                            'aria-expanded', 'data-testid', 'placeholder', 'for',
-                           'href', 'disabled', 'checked', 'selected', 'hidden', 'aria-disabled'}:
+                           'href', 'target', 'formtarget', 'disabled', 'checked', 'selected', 'hidden', 'aria-disabled'}:
                 del tag.attrs[key]
             elif key == 'href':
                 tag.attrs[key] = safe_href(str(tag.attrs[key]))
@@ -111,7 +112,7 @@ def _soup(html):
 
 
 def compact_dom(html: str, max_elements: int = 120, *, max_text: int = 120,
-                region_css: str | None = None, max_html: int = 12000) -> dict:
+                region_css: str | None = None, max_html: int = 12000, focus_terms=()) -> dict:
     """Local, bounded reduction. Raw HTML is never the default model payload."""
     if not (1 <= max_elements <= 200 and 1 <= max_text <= 500 and 100 <= max_html <= 50000):
         raise ValueError('Observation limits out of range')
@@ -122,7 +123,17 @@ def compact_dom(html: str, max_elements: int = 120, *, max_text: int = 120,
     region = soup.select_one(region_css) if region_css else soup
     if region is None:
         raise ValueError('Requested observation region does not exist')
+    terms = list(dict.fromkeys(str(t).strip().lower()[:80] for t in focus_terms if str(t).strip()))[:24]
+    relevance = {}
+    def relevant(tag):
+        key = id(tag)
+        if key not in relevance:
+            relevance[key] = any(t in tag.get_text(' ', strip=True).lower() for t in terms)
+        return relevance[key]
     candidates = region.select(CONTROLS)
+    if terms:
+        # Late-page controls must compete on task relevance, not DOM order alone.
+        candidates.sort(key=lambda tag: not relevant(tag))
     elements = []
     for tag in candidates[:max_elements]:
         parent = tag.find_parent(['form', 'section', 'article', 'dialog', 'li'])
@@ -145,11 +156,48 @@ def compact_dom(html: str, max_elements: int = 120, *, max_text: int = 120,
             "parent": _tag_context(parent, max_text),
             "container": _tag_context(tag.parent, max_text) if tag.parent and tag.parent.name != '[document]' else None,
             "href_path": safe_href(str(tag.get("href", ""))),
+            "target": str(tag.get("target", ""))[:160],
         })
+    contexts = region.select('h1,h2,h3,main,article,[role="main"],section[id],div[id],dl')
+    # Keep identifiers for content scopes as well as controls. This lets evidence
+    # target a complete article rather than a list of child links.
+    contexts = [t for t in contexts if t.name in {'h1','h2','h3','main','article','dl'} or
+                t.get('role') == 'main' or terms and relevant(t)]
+    headings = sorted((t for t in contexts if t.name in {'h1','h2','h3'}),
+                      key=lambda t: not relevant(t))[:6]
+    scopes = sorted((t for t in contexts if t.name not in {'h1','h2','h3'}),
+                    key=lambda t: (t.name not in {'main','article','dl'}, not relevant(t)))[:8]
+    content_regions = [dict(_tag_context(t, max_text), text_length=len(t.get_text(' ', strip=True)),
+                           parent=_tag_context(t.parent, max_text)) for t in headings + scopes]
+    text_matches = []
+    if terms:
+        # Distinguish prose mentions from links, even if both contain the target.
+        for term in terms:
+            matches = region.find_all(string=re.compile(re.escape(term), re.I), limit=2)
+            for node in matches:
+                tag = node.parent
+                text = tag.get_text(' ', strip=True)
+                start = max(0, text.lower().find(term) - max_text // 3)
+                text_matches.append(dict(_tag_context(tag, max_text),
+                    text=safe_text(text[start:start+max_text], max_text),
+                    parent=_tag_context(tag.parent, max_text)))
+                if len(text_matches) >= 24:
+                    break
+            if len(text_matches) >= 24:
+                break
     relevant_html = str(region)
+    if terms:
+        fragments = [str(t)[:1200] for t in candidates if relevant(t)][:24]
+        # Bounded snippets retain the exact link markup even far below the header.
+        relevant_html = '\n'.join(fragments) + '\n' + relevant_html
     text_truncated = any(len(tag.get_text(' ', strip=True)) > max_text for tag in candidates[:max_elements])
     return {"title": (soup.title.get_text(" ", strip=True) if soup.title else "")[:140],
             "elements": elements, "count": len(elements), 'total_candidates': len(candidates),
+            'content_regions': content_regions,
+            'text_matches': text_matches,
+            'locator_notes': 'href_path omits userinfo/query values and may be relative or resolved; '
+                             'it is not the literal href attribute. Plain #anchors stay on this document. '
+                             'Prose mentions are not automatically links.',
             'html': relevant_html[:max_html], 'untrusted_page_data': True, 'region_css': region_css,
             'truncated': input_truncated or text_truncated or len(candidates) > max_elements or len(relevant_html) > max_html}
 
@@ -161,15 +209,22 @@ def displayed_atom():
 
 
 def observe_session(driver, *, region_css: str | None = None, max_elements: int = 60,
-                    max_text: int = 120, max_html: int = 12000) -> dict:
+                    max_text: int = 120, max_html: int = 12000, focus_terms=()) -> dict:
     """One batch for live DOM + metadata, two window calls; no per-element round trips."""
     if not (1 <= max_elements <= 200 and 1 <= max_text <= 500 and 100 <= max_html <= 50000):
         raise ValueError('Observation limits out of range')
-    raw = driver.execute_script('const displayed = (' + displayed_atom() + ');' + r'''
+    terms = list(dict.fromkeys(str(t).strip().lower()[:80] for t in focus_terms if str(t).strip()))[:24]
+    script = 'const focusTerms = ' + json.dumps(terms, ensure_ascii=True) + ';'
+    raw = driver.execute_script(script + 'const displayed = (' + displayed_atom() + ');' + r'''
 const [region, selector, limit, textLimit] = arguments;
 const root = region ? document.querySelector(region) : document;
 if (!root) return {missing_region:true};
-const candidates = root.querySelectorAll(selector), live = [];
+const candidates = Array.from(root.querySelectorAll(selector)), live = [];
+if (focusTerms.length) {
+    const score = el => focusTerms.some(t => (el.textContent || "").toLowerCase().includes(t)) ? 0 : 1;
+    const scores = new Map(candidates.map(el => [el, score(el)]));
+    candidates.sort((a,b) => scores.get(a) - scores.get(b));
+}
 const sensitive = /password|passwd|token|secret|cookie|authorization|api.?key/i;
 let scanned = 0;
 for (const el of candidates) {
@@ -179,7 +234,7 @@ for (const el of candidates) {
     if (["hidden","password"].includes(attr("type").toLowerCase()) || sensitive.test(identity)) continue;
     const visible = displayed(el);
     live.push({tag:el.tagName.toLowerCase(), id:attr("id"), name:attr("name"),
-        ...Object.fromEntries(["class","type","data-testid","role","aria-checked","aria-expanded","aria-label"]
+        ...Object.fromEntries(["class","type","data-testid","role","aria-checked","aria-expanded","aria-label","target","formtarget"]
             .map(k => [k,attr(k).slice(0,160)])),
         href_path:String(el.href || attr("href")), visible, enabled:!el.matches(":disabled"),
         text:visible ? (el.innerText || el.textContent || "").slice(0,textLimit) : "",
@@ -193,7 +248,7 @@ return {html:document.documentElement.outerHTML.slice(0,2000001), live,
     if raw.get('missing_region'):
         raise ValueError('Requested observation region does not exist')
     snapshot = compact_dom(raw['html'], max_elements, max_text=max_text,
-                           region_css=region_css, max_html=max_html)
+                           region_css=region_css, max_html=max_html, focus_terms=terms)
     live = []
     for row in raw['live']:
         live.append({k: (v if isinstance(v, bool) else
@@ -204,7 +259,8 @@ return {html:document.documentElement.outerHTML.slice(0,2000001), live,
     snapshot.update(url=diagnostic_url(raw['url']), title=safe_text(raw['title'], 140),
                     current_window=driver.current_window_handle, windows=list(driver.window_handles),
                     frame_context=raw['frame_context'], ready_state=raw['ready_state'], live_elements=live,
-                    limitations=['top-level DOM only; no frame/window switching or Shadow DOM traversal'])
+                    limitations=['top-level DOM only; checked clicks follow one new same-origin window; '
+                                 'no arbitrary window/history selection, frame switching or Shadow DOM traversal'])
     snapshot['state_hash'] = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
     snapshot['observation_id'] = uuid.uuid4().hex
     return snapshot

@@ -18,11 +18,14 @@ from .fixture_server import runtime_fixture
 from .selenium_runtime import make_driver, reviewed_script, TRUSTED_SCRIPT_IDS, CHECKED_PHASES, phase_domain
 
 
-def checked_execution(driver, base_url, request, *, capture, save_screenshot, record_action=None, phase_event=None):
+def checked_execution(driver, base_url, request, *, capture, save_screenshot, record_action=None, phase_event=None,
+                      record_measurement=None):
     """Four measured stages; hard deadlines are enforced by the owning controller."""
-    from .checked_selenium import (execute_source, collect_measurements, normalize_bindings, execution_diagnostics)
+    from .checked_selenium import (execute_source, collect_measurements, normalize_bindings, execution_diagnostics,
+                                   check_navigation_state, NavigationStateError)
     started = time.monotonic()
-    result = dict(status='ERROR', measurements={}, actions=[], script_status='NOT_RUN', oracle_status='NOT_RUN',
+    result = dict(status='ERROR', measurements={}, actions=[], oracle_log=[],
+                  script_status='NOT_RUN', oracle_status='NOT_RUN',
                   timings=dict.fromkeys(CHECKED_PHASES,0.0), phase_status=dict.fromkeys(CHECKED_PHASES,'NOT_RUN'),
                   phase_limits=request.get('phase_limits',{}))
     progress, entry, current, stage = {}, None, None, 'preflight'
@@ -31,6 +34,19 @@ def checked_execution(driver, base_url, request, *, capture, save_screenshot, re
     def report():
         result['execution'] = execution_diagnostics(progress,result['actions'],stage=stage,entry=entry,current=current)
         return {k:v for k,v in result.items() if k != 'observation'}
+
+    def oracle_progress(record):
+        result['oracle_log'].append(record)
+        if record_measurement:
+            record_measurement(record)
+        if phase_event:
+            # Progress never starts a new phase or extends the existing deadline.
+            # Send only the new record/value, not every prior long body on every
+            # operation. The controller merges deltas for timeout diagnostics.
+            partial = dict(oracle_progress=record)
+            if record['event'] in {'observed','reused'}:
+                partial['measurements'] = {record['oracle_id']:result['measurements'][record['oracle_id']]}
+            phase_event('oracle_capture','progress',partial)
 
     @contextmanager
     def measured(name):
@@ -57,6 +73,7 @@ def checked_execution(driver, base_url, request, *, capture, save_screenshot, re
         with measured('pre_observe'):
             entry = capture(max_elements=80,max_html=16000)
             result['before_url'] = entry['url']
+            result.update(before_window=entry.get('current_window'), before_windows=entry.get('windows', []))
         stage = 'source'
         with measured('script_execute'):
             result['script_status'] = 'RUNNING'
@@ -72,7 +89,8 @@ def checked_execution(driver, base_url, request, *, capture, save_screenshot, re
             result['oracle_status'] = 'RUNNING'
             try:
                 result['measurements'] = collect_measurements(driver,base_url,queries,
-                    step_id=request.get('step_id'),batch=True)
+                    step_id=request.get('step_id'),batch=True,
+                    on_progress=oracle_progress,completed=result['measurements'])
             except Exception:
                 result['oracle_status'] = 'ERROR'
                 raise
@@ -88,8 +106,12 @@ def checked_execution(driver, base_url, request, *, capture, save_screenshot, re
     try:
         with measured('post_observe'):
             current = capture(max_elements=80,max_html=16000)
+            active_changed = entry is not None and entry.get('current_window') != current.get('current_window')
             result.update(observation=current,after_url=current['url'],
-                          navigated=result.get('before_url') != current['url'])
+                          after_window=current.get('current_window'), after_windows=current.get('windows', []),
+                          active_window_changed=active_changed,
+                          window_changed=active_changed or result.get('before_windows', []) != current.get('windows', []),
+                          navigated=result.get('before_url') != current['url'] or active_changed)
             name = current['observation_id'] + '.png'
             if save_screenshot(name) is False:
                 raise RuntimeError('Screenshot was not saved')
@@ -102,6 +124,15 @@ def checked_execution(driver, base_url, request, *, capture, save_screenshot, re
         if result['status'] == 'COMPLETE':
             result.update(status='ERROR',error_type=type(exc).__name__,failed_phase='post_observe',
                           failure_domain='observation',error='Post-execution observation/evidence persistence failed')
+    if result['status'] == 'COMPLETE':
+        try:
+            # A popup can appear during evidence/observation after the script's
+            # last poll. Use existing snapshots; no additional DOM scan or wait.
+            check_navigation_state(driver,result['actions'],entry=entry,current=current)
+        except NavigationStateError as exc:
+            stage, progress['operation'] = 'source', 'navigation'
+            result.update(status='ERROR',error_type=type(exc).__name__,error=str(exc),
+                          failed_phase='post_observe',failure_domain='navigation')
     report()
     result.update(elapsed_seconds=round(time.monotonic()-started,3),browser_session_id=driver.session_id)
     return result
@@ -133,8 +164,12 @@ def main():
             with (run_dir/'browser_actions.jsonl').open('a',encoding='utf-8') as trace:
                 trace.write(json.dumps(dict(step_id=request.get('step_id'),
                     browser_session_id=driver.session_id,**action),ensure_ascii=True)+'\n')
+        def record_measurement(record):
+            with (run_dir/'oracle_capture.jsonl').open('a',encoding='utf-8') as trace:
+                trace.write(json.dumps(dict(browser_session_id=driver.session_id,**record),ensure_ascii=True)+'\n')
         return checked_execution(driver,base_url,request,capture=capture,
             save_screenshot=lambda name: driver.save_screenshot(str(run_dir/name)),record_action=record_action,
+            record_measurement=record_measurement,
             phase_event=lambda name,event,partial: reply(dict(_runtime_phase=name,event=event,partial=partial)))
 
     try:

@@ -6,8 +6,11 @@ Only the trusted wrappers own Selenium objects. No model object reaches getattr.
 from __future__ import annotations
 
 import ast
+from copy import deepcopy
+from functools import lru_cache
 import operator
 import re
+import time
 from urllib.parse import urlsplit
 
 
@@ -27,10 +30,19 @@ ATTRIBUTES = frozenset({'get', 'find_element', 'find_elements', 'click', 'clear'
 ROOT_NAMES = {'driver', 'BASE_URL', 'By', 'Keys', 'EC', 'WebDriverWait', 'len'}
 OBSERVED_ATTRIBUTES = frozenset({'id', 'name', 'type', 'value', 'class', 'href', 'checked',
     'textContent', 'aria-label', 'aria-checked', 'aria-expanded', 'aria-disabled',
-    'data-testid', 'disabled', 'selected', 'role', 'placeholder'})
+    'data-testid', 'disabled', 'selected', 'role', 'placeholder', 'target', 'formtarget'})
 LOCATORS = {'css': 'css selector', 'css selector': 'css selector', 'css_selector': 'css selector',
             'xpath': 'xpath', 'id': 'id', 'name': 'name'}
 READS = {'count', 'text', 'texts', 'selected', 'selected_text', 'visible', 'enabled', 'attribute', 'exists', 'visible_exists'}
+TEXT_LIMIT = 2_000_000
+
+
+@lru_cache(maxsize=1)
+def rendered_text_script():
+    from pathlib import Path
+    return Path(__file__).with_name('rendered_text.js').read_text(encoding='utf-8')
+
+
 EVIDENCE_GUIDE = '''Trusted Runtime evidence semantics (not model Python return values):
 by supports css/xpath/id/name. count returns an INTEGER of VISIBLE matched elements
 (is_displayed filtered); texts returns their visible text list. Neither counts hidden
@@ -38,7 +50,9 @@ nodes. exists returns a BOOLEAN for any DOM match (including hidden nodes);
 visible_exists returns a BOOLEAN for any visible match. Empty collections yield
 count=0, texts=[], exists=false, visible_exists=false. selected/visible/enabled read
 the native state of exactly ONE existing target; missing/ambiguous targets are UNKNOWN,
-not false. text reads one visible target; attribute reads an allowed attribute string.
+not false. text reads one visible target; text/texts use complete rendered light-DOM
+text (hidden descendants excluded), not a 1000-character prefix. Incomplete/oversize
+text is UNKNOWN, never a truncated PASS/FAIL. attribute reads an allowed attribute string.
 selected_text reads the displayed label of the selected option of ONE native select,
 e.g. value="all" with label "All fields" returns "All fields", not "all".
 Missing/hidden select or missing/ambiguous selected options are UNKNOWN. Target the
@@ -91,29 +105,94 @@ def normalize_bindings(bindings, *, step_id=None, expected_ids=None):
     return result
 
 
-def collect_measurements(driver, base_url, bindings, *, step_id=None, batch=False):
-    """Native scalar semantics; Worker batches safety/visibility, never text for counts.
+def collect_measurements(driver, base_url, bindings, *, step_id=None, batch=False,
+                         on_progress=None, completed=None):
+    """Worker batches rendered text; counts never read text. No silent truncation.
 
     batch=False retains compatibility with callers supplying minimal driver adapters.
     Both paths use Selenium's own visibility predicate and the same evidence contract.
     """
-    from .dom_inspector import safe_text, safe_href, displayed_atom
-    result, matched = {}, {}
-    for key, query in normalize_bindings(bindings, step_id=step_id).items():
+    from .dom_inspector import safe_text, safe_href, displayed_atom, SECRET_TEXT
+    result = completed if completed is not None else {}
+    matched, measurements = {}, {}
+    queries = normalize_bindings(bindings, step_id=step_id)
+    started = time.monotonic()
+
+    def cache_key(query):
+        return LOCATORS[query['by']], query['selector'], query['read'], query.get('attribute'), query['step_id']
+
+    groups = {}
+    for key, query in queries.items():
+        groups.setdefault(cache_key(query), []).append(key)
+
+    for key, query in queries.items():
+        def notify(operation, event, mark, **extra):
+            if on_progress:
+                on_progress(dict(oracle_id=key, oracle_ids=groups[cache_key(query)],
+                    step_id=query['step_id'], by=query['by'], selector=safe_text(query['selector'],1000),
+                    read=query['read'], attribute=query.get('attribute'), operation=operation, event=event,
+                    started_seconds=round(mark-started,4), elapsed_seconds=round(time.monotonic()-mark,4), **extra))
+
+        def run(operation, fn):
+            mark = time.monotonic()
+            notify(operation,'started',mark)
+            try:
+                value = fn()
+            except Exception as exc:
+                notify(operation,'error',mark,error_type=type(exc).__name__)
+                raise
+            notify(operation,'complete',mark)
+            return value
+
+        def read_text(elements):
+            if not elements:
+                return []
+            if batch:
+                rows = run('rendered_text', lambda: driver.execute_script(rendered_text_script(), elements, TEXT_LIMIT))
+                if len(rows) != len(elements):
+                    raise ValueError('Incomplete rendered text response')
+            else:
+                # Legacy/native adapters still enforce completeness and the same
+                # text limit. The managed Worker ALWAYS selects batch=True.
+                rows = run('native_text', lambda: [
+                    dict(text=n.text, status='observed', text_complete=True, text_method='native') for n in elements])
+            for row in rows:
+                text = row.get('text')
+                if text is not None:
+                    row['text_length'] = len(text)
+                    if len(text) > TEXT_LIMIT:
+                        row.update(text=None,status='text_limit_exceeded',text_complete=False)
+                    else:
+                        # Redaction can lengthen a string. Never cut off its tail
+                        # using the original length after replacing a secret.
+                        redacted = SECRET_TEXT.sub(r'\1=[REDACTED]',text)
+                        row['text'] = redacted
+                        if len(redacted) > TEXT_LIMIT:
+                            row.update(text=None,status='text_limit_exceeded',text_complete=False)
+                row['text_limit'] = TEXT_LIMIT
+            return rows
+
         try:
             locator = LOCATORS[query['by']], query['selector']
+            # Scope is ONE collection only. Different reads/attributes/steps never
+            # share values, even when their locator happens to be identical.
+            measurement_key = cache_key(query)
+            if measurement_key in measurements:
+                result[key] = dict(query, **deepcopy(measurements[measurement_key]))
+                notify('measurement','reused',time.monotonic(),reused_from=groups[measurement_key][0])
+                continue
             if locator not in matched:
-                nodes = driver.find_elements(*locator)
+                nodes = run('locate', lambda: driver.find_elements(*locator))
                 if len(nodes) > 200:
                     raise ValueError('More than 200 matches; narrow the locator instead of truncating a count')
                 if batch and nodes:
-                    states = driver.execute_script('const displayed = (' + displayed_atom() + ');' + r'''
+                    states = run('visibility', lambda: driver.execute_script('const displayed = (' + displayed_atom() + ');' + r'''
 return arguments[0].map(el => ({
     sensitive:/password|passwd|secret|token|api.?key|credit.?card/i.test(
         ["type","name","id","autocomplete"].map(k => el.getAttribute(k) || "").join(" ")),
     visible:displayed(el)
 }));
-''', nodes)
+''', nodes))
                     if len(states) != len(nodes):
                         raise ValueError('Incomplete batch visibility response')
                     if any(s['sensitive'] for s in states):
@@ -122,10 +201,10 @@ return arguments[0].map(el => ({
                     visible = [n for n,s in zip(nodes,states) if s['visible']]
                 else:
                     wrapped = [Element(n, Browser(driver, base_url)) for n in nodes]
-                    visible = [n for n in wrapped if n.is_displayed()]
+                    visible = run('visibility', lambda: [n for n in wrapped if n.is_displayed()])
                 matched[locator] = nodes, wrapped, visible
             nodes, wrapped, visible = matched[locator]
-            kind, value, status = query['read'], None, 'observed'
+            kind, value, status, details = query['read'], None, 'observed', {}
             if kind == 'count':
                 value = len(visible)
             elif kind == 'exists':
@@ -133,12 +212,26 @@ return arguments[0].map(el => ({
             elif kind == 'visible_exists':
                 value = bool(visible)
             elif kind == 'texts':
-                value = [safe_text(n.text, 500) for n in visible]
+                rows = read_text([n for n in nodes if n in visible] if batch else
+                                 [n for n,w in zip(nodes,wrapped) if w in visible])
+                value = [row['text'] for row in rows]
+                problem = next((row['status'] for row in rows if row['status'] != 'observed'), None)
+                if sum(len(t or '') for t in value) > TEXT_LIMIT:
+                    problem = 'text_limit_exceeded'
+                status = problem or 'observed'
+                if problem:
+                    value = None
+                details = dict(text_complete=not problem,text_method='rendered_dom' if batch else 'native',
+                               text_limit=TEXT_LIMIT,text_length=sum(row.get('text_length',0) for row in rows))
             elif len(nodes) != 1:
                 status = 'missing' if not nodes else 'ambiguous'
             elif kind == 'text':
-                value = safe_text(wrapped[0].text, 1000) if visible else None
-                status = 'observed' if visible else 'hidden'
+                if visible:
+                    row = read_text(nodes)[0]
+                    value, status = row['text'], row['status']
+                    details = {k:v for k,v in row.items() if k not in {'text','status'}}
+                else:
+                    status = 'hidden'
             elif kind == 'selected_text':
                 if nodes[0].tag_name.lower() != 'select':
                     raise ValueError('selected_text requires a native select target; use text for an option')
@@ -146,24 +239,40 @@ return arguments[0].map(el => ({
                     status = 'hidden'
                 else:
                     from selenium.webdriver.common.by import By
-                    options = nodes[0].find_elements(By.TAG_NAME, 'option')
+                    options = run('select_options',lambda: nodes[0].find_elements(By.TAG_NAME, 'option'))
                     if len(options) > 200:
                         raise ValueError('selected_text supports at most 200 options')
-                    selected = [n for n in options if n.is_selected()]
+                    selected = run('selected_state',lambda: [n for n in options if n.is_selected()])
                     if len(selected) != 1:
                         status = 'selection_missing' if not selected else 'selection_ambiguous'
                     else:
-                        value = safe_text(Element(selected[0], Browser(driver, base_url)).text, 1000)
+                        # OPTION rendered layout differs from its select; native
+                        # labels are small and preserve existing dropdown semantics.
+                        row = read_text(selected)[0] if not batch else None
+                        if batch:
+                            raw = run('selected_text',lambda: selected[0].text)
+                            row = dict(text=safe_text(raw,len(raw)),status='observed',text_complete=True)
+                            if len(raw) > TEXT_LIMIT:
+                                row.update(text=None,status='text_limit_exceeded',text_complete=False)
+                        value,status = row['text'],row['status']
+                        details = {k:v for k,v in row.items() if k not in {'text','status'}}
             elif kind in {'selected', 'visible', 'enabled'}:
                 method = {'selected': 'is_selected', 'visible': 'is_displayed', 'enabled': 'is_enabled'}[kind]
-                value = getattr(wrapped[0], method)()
+                value = run(kind,lambda: getattr(wrapped[0], method)())
             elif kind == 'attribute':
-                raw = wrapped[0].get_attribute(query['attribute'])
-                value = (safe_href(raw) if query['attribute'] == 'href' else safe_text(raw, 1000)) if raw is not None else None
+                raw = run('attribute',lambda: wrapped[0].get_attribute(query['attribute']))
+                value = (safe_href(raw) if query['attribute'] == 'href' else safe_text(raw, len(raw))) if raw is not None else None
                 if raw is None:
                     status = 'attribute_missing'
-            result[key] = dict(query, value=value, status=status, matched=len(nodes), visible=len(visible),
-                               visible_only=kind in {'count', 'text', 'texts', 'visible_exists'})
+                elif len(raw) > TEXT_LIMIT:
+                    value,status = None,'text_limit_exceeded'
+                    details = dict(text_complete=False,text_limit=TEXT_LIMIT,text_length=len(raw))
+            measured = dict(value=value, status=status, matched=len(nodes), visible=len(visible),
+                            visible_only=kind in {'count', 'text', 'texts', 'visible_exists'}, **details)
+            measurements[measurement_key] = deepcopy(measured)
+            result[key] = dict(query, **measured)
+            notify('measurement','observed',time.monotonic(),status=status,
+                   text_length=details.get('text_length'),text_complete=details.get('text_complete'))
         except Exception as exc:
             raise ValueError(f'Step {query["step_id"]} Oracle {key}: {type(exc).__name__}: '
                              + safe_text(str(exc).splitlines()[0], 600)) from exc
@@ -238,11 +347,188 @@ def validate_source(source):
     return tree
 
 
+class NavigationStateError(RuntimeError):
+    """A returned WebDriver call did not establish the intended navigation state."""
+
+
+def check_navigation_state(driver, actions, *, entry=None, current=None):
+    """Technical reachability check, never a comparison against business Oracles.
+
+    A different-document link must leave its entry URL/window. Redirects are
+    allowed; this does not claim the destination content satisfies the user.
+    Fragment controls and links to the current document need not navigate.
+    """
+    activations = [a for a in actions if 'before_windows' in a]
+    observed_windows = bool(actions and entry and current and entry.get('windows'))
+    if not activations and not observed_windows:
+        return
+    last = activations[-1] if activations else actions[-1]
+    if observed_windows:
+        before, windows, active = entry['windows'], current['windows'], current['current_window']
+    else:
+        before = last['before_windows']
+        windows, active = list(driver.window_handles), driver.current_window_handle
+    added = [h for h in windows if h not in before]
+    if observed_windows:
+        followed = {a.get('after_window') for a in activations if a.get('window_status') == 'switched'}
+        added = [h for h in added if h not in followed]
+    if added and (len(added) != 1 or active != added[0]):
+        last['navigation_check'] = 'unselected_or_ambiguous_window'
+        raise NavigationStateError('New window(s) exist but the active window is not the unique destination; '
+                                   'old-page generic elements cannot confirm navigation. '
+                                   'Use the supported link activation and wait for a destination-specific element.')
+    for action in activations:
+        if action.get('expects_navigation') and not action.get('navigated'):
+            action['navigation_check'] = 'entry_page_unchanged'
+            raise NavigationStateError('Link activation has not left its entry page: '
+                + action.get('requested_url', '[unknown]') + '; action at line '
+                + str(action.get('start_line', '?')) + '. Generic headings/containers on the old page '
+                'do not confirm arrival; wait for a destination-specific technical element. '
+                'Do not change frozen Oracles or repeat a successful write.')
+        action['navigation_check'] = 'reached' if action.get('navigated') else 'not_required'
+
+
 class Browser:
+    # Inside the existing script phase deadline, never an extra per-step budget.
+    WINDOW_WAIT_SECONDS = 2.0
+
     def __init__(self, driver, base_url, *, actions=None, on_action=None, progress=None):
         self._driver, self._origin = driver, origin(base_url)
         self._actions, self._on_action = actions, on_action
         self._progress = progress if progress is not None else {}
+        self._pending_window = None
+
+    def _window_handle(self):
+        from selenium.common.exceptions import NoSuchWindowException
+        try:
+            return self._driver.current_window_handle
+        except NoSuchWindowException:
+            return None
+
+    def _sync_windows(self, *, wait_for_target=False):
+        """Follow one new same-origin window; ordinary clicks never sleep.
+
+        Unannounced JS popups are checked on subsequent driver reads / EC polls.
+        An explicit new target (or an observed blank new window) gets a bounded
+        navigation wait. Never choose an arbitrary handle from multiple windows.
+        """
+        pending = self._pending_window
+        if pending is None:
+            return
+        record = pending['record']
+        previous = dict(record)
+        deadline = time.monotonic() + self.WINDOW_WAIT_SECONDS
+        waiting = wait_for_target and pending['expects_new']
+        selected = None
+        try:
+            while True:
+                handles = list(self._driver.window_handles)
+                new = [h for h in handles if h not in pending['handles']]
+                record.update(after_windows=handles, new_windows=new)
+                if len(new) > 1:
+                    record['window_status'] = 'ambiguous'
+                    raise RuntimeError('Click opened multiple new windows; automatic selection is unsupported')
+                if new:
+                    if selected != new[0]:
+                        self._driver.switch_to.window(new[0])
+                        selected = new[0]
+                    url = self._driver.current_url
+                    if url not in ('', 'about:blank'):
+                        try:
+                            self._check_url(url)
+                        except (PermissionError, ValueError):
+                            record['window_status'] = 'rejected_origin'
+                            raise PermissionError('New window is outside the authorized HTTP(S) origin')
+                        record.update(window_status='switched', after_window=new[0],
+                                      navigation_type='new_window')
+                        self._pending_window = None
+                        break
+                    # window.open() may return a blank window before assigning location.
+                    waiting = True
+                    record['window_status'] = 'waiting_for_url'
+                elif pending['handle'] not in handles:
+                    record['window_status'] = 'source_closed'
+                    raise RuntimeError('Source window closed without one identifiable new window')
+                else:
+                    record['window_status'] = 'waiting_for_window' if waiting else 'no_new_window'
+                if not waiting:
+                    break
+                if time.monotonic() >= deadline:
+                    from selenium.common.exceptions import TimeoutException
+                    record['window_status'] = 'timeout'
+                    raise TimeoutException('New-window navigation did not resolve to one authorized page within 2s; '
+                                           'popup may be blocked or still blank')
+                time.sleep(.05)
+        except Exception as exc:
+            self._pending_window = None
+            # Do not leave later observations/evidence focused on an unauthorized page.
+            if pending['handle'] in self._driver.window_handles:
+                self._driver.switch_to.window(pending['handle'])
+            record.update(status='error', error_type=type(exc).__name__)
+            raise
+        finally:
+            record['after_url'] = self._url()
+            record['after_window'] = self._window_handle()
+            record['navigated'] = (record['before_url'] != record['after_url']
+                                   or record['before_window'] != record['after_window'])
+            if record.get('navigation_type') != 'new_window':
+                record['navigation_type'] = 'same_window' if record['navigated'] else 'none'
+            # A delayed switch updates the ORIGINAL click, not a fabricated action.
+            if record['status'] != 'started' and record != previous and self._on_action:
+                self._on_action(dict(record))
+
+    def _activate(self, element, target, fn, *, action='click'):
+        self._sync_windows()
+        # One metadata command also handles clicking an anchor's child and base/form
+        # targets. No page JS is exposed to generated Python; no input values are read.
+        info = self._driver.execute_script("""
+const el = arguments[0], a = el.closest('a[href],area[href]');
+const rect = el.getBoundingClientRect();
+if (el.tagName !== 'OPTION' && rect.width && rect.height &&
+    (rect.top < 80 || rect.bottom > innerHeight - 80)) {
+    el.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});
+}
+const form = !a && el.form && (el.type === 'submit' || el.type === 'image') ? el.form : null;
+const base = document.querySelector('base[target]');
+return {href: a ? a.href : '', target: (a ? a.getAttribute('target') :
+    form ? el.getAttribute('formtarget') || form.getAttribute('target') : '') ||
+    ((a || form) && base ? base.getAttribute('target') : '') || ''};
+""", element)
+        if info['href']:
+            self._check_url(info['href'])
+        from .dom_inspector import diagnostic_url
+        hint = info['target'].lower()
+        before = self._driver.current_url
+        def document(url):
+            return urlsplit(url)._replace(fragment='').geturl()
+        window = dict(handle=self._driver.current_window_handle, handles=list(self._driver.window_handles),
+                      expects_new=bool(hint and hint not in {'_self', '_parent', '_top'}),
+                      requested_url=diagnostic_url(info['href']) if info['href'] else None,
+                      expects_navigation=bool(info['href'] and document(info['href']) != document(before)))
+        def activate_and_follow():
+            try:
+                fn()
+            except Exception as exc:
+                from selenium.common.exceptions import ElementClickInterceptedException
+                if isinstance(exc, ElementClickInterceptedException):
+                    try:
+                        detail = self._driver.execute_script("""
+const el=arguments[0], r=el.getBoundingClientRect();
+const x=Math.max(0,Math.min(innerWidth-1,(r.left+r.right)/2));
+const y=Math.max(0,Math.min(innerHeight-1,(r.top+r.bottom)/2));
+const hit=document.elementFromPoint(x,y);
+const brief=n=>n?{tag:n.tagName,id:n.id,classes:String(n.className).slice(0,200)}:null;
+return {target:brief(el),blocker:brief(hit),point:{x,y},
+        rect:{top:r.top,bottom:r.bottom,left:r.left,right:r.right},
+        viewport:{width:innerWidth,height:innerHeight},target_hit:hit===el||el.contains(hit)};
+""", element)
+                        self._pending_window['record']['click_diagnostic'] = detail
+                    except Exception:
+                        pass  # Diagnostics must never replace the original Selenium error.
+                raise
+            self._sync_windows(wait_for_target=True)
+            self._check_url(self._driver.current_url)
+        self._action(action, target, activate_and_follow, window=window)
 
     def _url(self):
         from .dom_inspector import diagnostic_url
@@ -251,16 +537,23 @@ class Browser:
         except Exception:
             return '[unavailable]'
 
-    def _action(self, action, target, fn):
+    def _action(self, action, target, fn, *, window=None):
+        # Clear/input actions can follow a click whose JS opened a window later.
+        if window is None:
+            self._sync_windows()
         self._progress['operation'] = 'action'
-        if self._actions is None:
-            return fn()
         from .dom_inspector import safe_text
         record = dict(action=action,target=safe_text(target,300),before_url=self._url(),status='started')
         record.update(self._progress.get('top_level_statement', {}))
-        if len(self._actions) >= 200:
-            raise ValueError('Action log limit exceeded (200)')
-        self._actions.append(record)
+        if window is not None:
+            record.update(before_window=window['handle'], before_windows=window['handles'],
+                          window_status='pending', expects_new_window=window['expects_new'],
+                          requested_url=window['requested_url'], expects_navigation=window['expects_navigation'])
+            self._pending_window = dict(window, record=record)
+        if self._actions is not None:
+            if len(self._actions) >= 200:
+                raise ValueError('Action log limit exceeded (200)')
+            self._actions.append(record)
         if self._on_action:
             self._on_action(dict(record))
         try:
@@ -268,11 +561,16 @@ class Browser:
             record['status'] = 'complete'
             return result
         except Exception as exc:
+            if window is not None:
+                self._pending_window = None
             record.update(status='error',error_type=type(exc).__name__)
             raise
         finally:
+            if window is not None:
+                record.update(after_window=self._window_handle(), after_windows=list(self._driver.window_handles))
             record['after_url'] = self._url()
-            record['navigated'] = record['before_url'] != record['after_url']
+            record['navigated'] = (record['before_url'] != record['after_url'] or
+                                  record.get('before_window') != record.get('after_window'))
             if self._on_action:
                 self._on_action(dict(record))
 
@@ -282,22 +580,28 @@ class Browser:
 
     def get(self, url):
         self._check_url(url)
+        self._sync_windows()
+        self._pending_window = None
         from .dom_inspector import diagnostic_url
         self._action('get',diagnostic_url(url),lambda: self._driver.get(url))
         self._check_url(self._driver.current_url)
 
     def find_element(self, by, value):
+        self._sync_windows()
         return Element(self._driver.find_element(by, value), self, target=f'{by}: {value}')
 
     def find_elements(self, by, value):
+        self._sync_windows()
         return [Element(e, self, target=f'{by}: {value}') for e in self._driver.find_elements(by, value)[:200]]
 
     @property
     def title(self):
+        self._sync_windows()
         return self._driver.title
 
     @property
     def current_url(self):
+        self._sync_windows()
         return self._driver.current_url
 
 
@@ -310,11 +614,7 @@ class Element:
             raise PermissionError('Sensitive controls are outside this demo')
 
     def click(self):
-        href = self._element.get_attribute('href')
-        if href:
-            self._browser._check_url(href)
-        self._browser._action('click',self._target,self._element.click)
-        self._browser._check_url(self._browser.current_url)
+        self._browser._activate(self._element, self._target, self._element.click)
 
     def clear(self):
         self._browser._action('clear',self._target,self._element.clear)
@@ -322,8 +622,14 @@ class Element:
     def send_keys(self, *values):
         if not values or sum(len(str(v)) for v in values) > 2000:
             raise ValueError('Input exceeds the research demo limit')
-        # Log the action and locator, never input text/credentials.
-        self._browser._action('send_keys',self._target,lambda: self._element.send_keys(*values))
+        # Enter may activate a link OR submit a form. Reuse trusted activation,
+        # without logging input values or imposing a wait on ordinary text input.
+        from selenium.webdriver.common.keys import Keys
+        send = lambda: self._element.send_keys(*values)
+        if any(Keys.ENTER in str(value) for value in values):
+            self._browser._activate(self._element, self._target, send, action='send_keys')
+        else:
+            self._browser._action('send_keys',self._target,send)
 
     def get_attribute(self, name):
         if name not in OBSERVED_ATTRIBUTES:
@@ -491,6 +797,10 @@ def execute_source(source, driver, base_url, *, actions=None, on_action=None, pr
             start_column=statement.col_offset,end_column=statement.end_col_offset)
         statement_run(statement)
         progress['completed_end_line'] = statement.end_lineno
+    # Reconcile before Oracle collection and post-observation use this same driver.
+    browser._sync_windows()
+    progress['operation'] = 'navigation'
+    check_navigation_state(driver, browser._actions)
     progress.update(source_complete=True,operation='complete')
 
 
@@ -505,7 +815,8 @@ def execution_diagnostics(progress, actions, *, stage, entry=None, current=None)
              'during_action' if operation == 'action' or any(a['status'] != 'complete' for a in actions) else
              'after_action' if completed or (stage == 'evidence' and progress.get('source_complete')) else 'before_action')
     def state(view):
-        return {k: view[k] for k in ('url', 'state_hash', 'observation_ref') if k in (view or {})}
+        return {k: view[k] for k in ('url', 'state_hash', 'observation_ref', 'current_window', 'windows')
+                if k in (view or {})}
     before, after = state(entry), state(current)
     return dict(phase=phase, failed_operation=operation, source_complete=progress.get('source_complete', False),
                 completed_end_line=progress.get('completed_end_line', 0),

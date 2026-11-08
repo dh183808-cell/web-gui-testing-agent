@@ -34,6 +34,7 @@ class Agent5EvidenceVerifier:
                 except ValueError as exc:
                     return Verdict(status='ERROR',message='Formal evidence binding type error: '+str(exc))
             if (actual is None or measurement.get('status', 'observed') != 'observed'
+                    or measurement.get('text_complete') is False or measurement.get('truncated') is True
                     or not measurement.get('observation_ref') or not measurement.get('screenshot_ref')
                     or measurement.get('step_id', oracle.get('step_id')) != oracle.get('step_id')):
                 passed = None
