@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 import uuid
+from functools import lru_cache
+from pkgutil import get_data
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from bs4 import BeautifulSoup, Comment
 from .selenium_runtime import make_driver
@@ -152,37 +154,56 @@ def compact_dom(html: str, max_elements: int = 120, *, max_text: int = 120,
             'truncated': input_truncated or text_truncated or len(candidates) > max_elements or len(relevant_html) > max_html}
 
 
+@lru_cache(maxsize=1)
+def displayed_atom():
+    """Use the SAME visibility implementation as installed Selenium, including opacity."""
+    return get_data('selenium.webdriver.remote', 'isDisplayed.js').decode('utf-8')
+
+
 def observe_session(driver, *, region_css: str | None = None, max_elements: int = 60,
                     max_text: int = 120, max_html: int = 12000) -> dict:
-    """The caller owns the driver. This never creates/closes it or changes frames."""
-    from selenium.webdriver.common.by import By
-
-    snapshot = compact_dom(driver.page_source, max_elements, max_text=max_text,
+    """One batch for live DOM + metadata, two window calls; no per-element round trips."""
+    if not (1 <= max_elements <= 200 and 1 <= max_text <= 500 and 100 <= max_html <= 50000):
+        raise ValueError('Observation limits out of range')
+    raw = driver.execute_script('const displayed = (' + displayed_atom() + ');' + r'''
+const [region, selector, limit, textLimit] = arguments;
+const root = region ? document.querySelector(region) : document;
+if (!root) return {missing_region:true};
+const candidates = root.querySelectorAll(selector), live = [];
+const sensitive = /password|passwd|token|secret|cookie|authorization|api.?key/i;
+let scanned = 0;
+for (const el of candidates) {
+    if (scanned++ >= limit * 2 || live.length >= limit) break;
+    const attr = key => el.getAttribute(key) || "";
+    const identity = ["id","name","autocomplete","aria-label"].map(attr).join(" ");
+    if (["hidden","password"].includes(attr("type").toLowerCase()) || sensitive.test(identity)) continue;
+    const visible = displayed(el);
+    live.push({tag:el.tagName.toLowerCase(), id:attr("id"), name:attr("name"),
+        ...Object.fromEntries(["class","type","data-testid","role","aria-checked","aria-expanded","aria-label"]
+            .map(k => [k,attr(k).slice(0,160)])),
+        href_path:String(el.href || attr("href")), visible, enabled:!el.matches(":disabled"),
+        text:visible ? (el.innerText || el.textContent || "").slice(0,textLimit) : "",
+        value:String(el.value || "").slice(0,textLimit), checked:el.checked === true});
+}
+return {html:document.documentElement.outerHTML.slice(0,2000001), live,
+    url:location.href, title:document.title, ready_state:document.readyState,
+    frame_context:window === window.top ? "top" : "unsupported",
+    truncated:candidates.length > scanned};
+''', region_css, CONTROLS, max_elements, max_text)
+    if raw.get('missing_region'):
+        raise ValueError('Requested observation region does not exist')
+    snapshot = compact_dom(raw['html'], max_elements, max_text=max_text,
                            region_css=region_css, max_html=max_html)
-    root = driver.find_element(By.CSS_SELECTOR, region_css) if region_css else driver
     live = []
-    for node in root.find_elements(By.CSS_SELECTOR, CONTROLS)[:max_elements * 2]:
-        try:
-            identity = ' '.join(node.get_attribute(k) or '' for k in ('id', 'name', 'aria-label'))
-            if (node.get_attribute('type') or '').lower() in {'hidden', 'password'} or SENSITIVE.search(identity):
-                continue
-            live.append({'tag': node.tag_name, 'id': safe_text(node.get_attribute('id'), 100),
-                         'name': safe_text(node.get_attribute('name'), 100),
-                         **{k: safe_text(node.get_attribute(k), 160) for k in
-                            ('class', 'type', 'data-testid', 'role', 'aria-checked', 'aria-expanded', 'aria-label')},
-                         'href_path': safe_href(node.get_attribute('href') or ''),
-                         'visible': node.is_displayed(), 'enabled': node.is_enabled(),
-                         'text': safe_text(node.text, max_text),
-                         'value': safe_text(node.get_property('value'), max_text),
-                         'checked': node.get_property('checked') is True})
-        except Exception:
-            snapshot['truncated'] = True
-        if len(live) >= max_elements:
-            break
-    snapshot.update(url=diagnostic_url(driver.current_url), title=safe_text(driver.title, 140),
+    for row in raw['live']:
+        live.append({k: (v if isinstance(v, bool) else
+                        safe_href(v) if k == 'href_path' else
+                        safe_text(v, max_text if k in {'text', 'value'} else 100 if k in {'id','name'} else 160))
+                     for k,v in row.items()})
+    snapshot['truncated'] |= raw['truncated']
+    snapshot.update(url=diagnostic_url(raw['url']), title=safe_text(raw['title'], 140),
                     current_window=driver.current_window_handle, windows=list(driver.window_handles),
-                    frame_context='top' if driver.execute_script('return window === window.top') else 'unsupported',
-                    ready_state=driver.execute_script('return document.readyState'), live_elements=live,
+                    frame_context=raw['frame_context'], ready_state=raw['ready_state'], live_elements=live,
                     limitations=['top-level DOM only; no frame/window switching or Shadow DOM traversal'])
     snapshot['state_hash'] = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
     snapshot['observation_id'] = uuid.uuid4().hex

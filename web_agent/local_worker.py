@@ -5,7 +5,7 @@ interprets the checked Selenium subset; never executes arbitrary model bytecode.
 """
 from __future__ import annotations
 
-from contextlib import redirect_stdout, nullcontext
+from contextlib import redirect_stdout, nullcontext, contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -13,9 +13,98 @@ import sys
 import time
 import traceback
 
-from .dom_inspector import observe_session, safe_text, safe_url, diagnostic_url
+from .dom_inspector import observe_session, safe_text, safe_url
 from .fixture_server import runtime_fixture
-from .selenium_runtime import make_driver, reviewed_script, TRUSTED_SCRIPT_IDS
+from .selenium_runtime import make_driver, reviewed_script, TRUSTED_SCRIPT_IDS, CHECKED_PHASES, phase_domain
+
+
+def checked_execution(driver, base_url, request, *, capture, save_screenshot, record_action=None, phase_event=None):
+    """Four measured stages; hard deadlines are enforced by the owning controller."""
+    from .checked_selenium import (execute_source, collect_measurements, normalize_bindings, execution_diagnostics)
+    started = time.monotonic()
+    result = dict(status='ERROR', measurements={}, actions=[], script_status='NOT_RUN', oracle_status='NOT_RUN',
+                  timings=dict.fromkeys(CHECKED_PHASES,0.0), phase_status=dict.fromkeys(CHECKED_PHASES,'NOT_RUN'),
+                  phase_limits=request.get('phase_limits',{}))
+    progress, entry, current, stage = {}, None, None, 'preflight'
+    active = 'pre_observe'
+
+    def report():
+        result['execution'] = execution_diagnostics(progress,result['actions'],stage=stage,entry=entry,current=current)
+        return {k:v for k,v in result.items() if k != 'observation'}
+
+    @contextmanager
+    def measured(name):
+        nonlocal active
+        active = name
+        result['phase_status'][name] = 'RUNNING'
+        if phase_event:
+            phase_event(name,'started',report())
+        mark = time.monotonic()
+        try:
+            yield
+        except Exception:
+            result['phase_status'][name] = 'ERROR'
+            raise
+        else:
+            result['phase_status'][name] = 'COMPLETE'
+        finally:
+            result['timings'][name] = round(time.monotonic()-mark,3)
+            if phase_event:
+                phase_event(name,'finished',report())
+
+    try:
+        queries = normalize_bindings(request.get('queries', {}), step_id=request.get('step_id'))
+        with measured('pre_observe'):
+            entry = capture(max_elements=80,max_html=16000)
+            result['before_url'] = entry['url']
+        stage = 'source'
+        with measured('script_execute'):
+            result['script_status'] = 'RUNNING'
+            try:
+                execute_source(request['source'],driver,base_url,actions=result['actions'],
+                               on_action=record_action,progress=progress)
+            except Exception:
+                result['script_status'] = 'ERROR'
+                raise
+            result['script_status'] = 'COMPLETE'
+        stage = 'evidence'
+        with measured('oracle_capture'):
+            result['oracle_status'] = 'RUNNING'
+            try:
+                result['measurements'] = collect_measurements(driver,base_url,queries,
+                    step_id=request.get('step_id'),batch=True)
+            except Exception:
+                result['oracle_status'] = 'ERROR'
+                raise
+            result['oracle_status'] = 'COMPLETE'
+        stage = 'complete'
+        result['status'] = 'COMPLETE'
+    except Exception as exc:
+        result.update(status='ERROR',error_type=type(exc).__name__,failed_phase=active,
+            failure_domain=phase_domain(active),
+            error=safe_text(str(exc).splitlines()[0] if str(exc) else type(exc).__name__,1200))
+    # Source/Oracle progress survives a failed observation. Missing formal evidence
+    # remains ERROR; it is never presented as a failed Selenium operation or a PASS.
+    try:
+        with measured('post_observe'):
+            current = capture(max_elements=80,max_html=16000)
+            result.update(observation=current,after_url=current['url'],
+                          navigated=result.get('before_url') != current['url'])
+            name = current['observation_id'] + '.png'
+            if save_screenshot(name) is False:
+                raise RuntimeError('Screenshot was not saved')
+            current['screenshot_ref'] = name
+            result['screenshot_ref'] = name
+            for m in result['measurements'].values():
+                m.update(observation_ref=current['observation_ref'],screenshot_ref=name)
+    except Exception as exc:
+        result['observation_error_type'] = type(exc).__name__
+        if result['status'] == 'COMPLETE':
+            result.update(status='ERROR',error_type=type(exc).__name__,failed_phase='post_observe',
+                          failure_domain='observation',error='Post-execution observation/evidence persistence failed')
+    report()
+    result.update(elapsed_seconds=round(time.monotonic()-started,3),browser_session_id=driver.session_id)
+    return result
 
 
 def main():
@@ -40,37 +129,13 @@ def main():
         return observation
 
     def checked(request):
-        from .checked_selenium import execute_source, collect_measurements, normalize_bindings
-        started = time.monotonic()
-        result = dict(status='ERROR', measurements={}, actions=[])
         def record_action(action):
             with (run_dir/'browser_actions.jsonl').open('a',encoding='utf-8') as trace:
                 trace.write(json.dumps(dict(step_id=request.get('step_id'),
                     browser_session_id=driver.session_id,**action),ensure_ascii=True)+'\n')
-        try:
-            result['before_url'] = diagnostic_url(driver.current_url)
-            queries = normalize_bindings(request.get('queries', {}), step_id=request.get('step_id'))
-            execute_source(request['source'], driver, base_url,actions=result['actions'],on_action=record_action)
-            result['measurements'] = collect_measurements(driver, base_url, queries, step_id=request.get('step_id'))
-            result['status'] = 'COMPLETE'
-        except Exception as exc:
-            result.update(status='ERROR', error_type=type(exc).__name__,
-                          error=safe_text(str(exc).splitlines()[0] if str(exc) else type(exc).__name__, 1200))
-        try:
-            observation = capture(max_elements=80, max_html=16000)
-            name = observation['observation_id'] + '.png'
-            driver.save_screenshot(str(run_dir / name))
-            observation['screenshot_ref'] = name
-            result.update(observation=observation, screenshot_ref=name)
-            result.update(after_url=observation['url'],
-                          navigated=result.get('before_url') != observation['url'])
-            for m in result['measurements'].values():
-                m['observation_ref'] = observation['observation_ref']
-                m['screenshot_ref'] = name
-        except Exception as exc:
-            result['observation_error_type'] = type(exc).__name__
-        result.update(elapsed_seconds=round(time.monotonic()-started,3), browser_session_id=driver.session_id)
-        return result
+        return checked_execution(driver,base_url,request,capture=capture,
+            save_screenshot=lambda name: driver.save_screenshot(str(run_dir/name)),record_action=record_action,
+            phase_event=lambda name,event,partial: reply(dict(_runtime_phase=name,event=event,partial=partial)))
 
     try:
         environment = (nullcontext((config['start_url'], {'submissions': []})) if config.get('start_url')

@@ -91,17 +91,40 @@ def normalize_bindings(bindings, *, step_id=None, expected_ids=None):
     return result
 
 
-def collect_measurements(driver, base_url, bindings, *, step_id=None):
-    """Read real DOM only. Missing/ambiguous scalar targets are unknown, never False."""
-    from .dom_inspector import safe_text, safe_href
-    result = {}
+def collect_measurements(driver, base_url, bindings, *, step_id=None, batch=False):
+    """Native scalar semantics; Worker batches safety/visibility, never text for counts.
+
+    batch=False retains compatibility with callers supplying minimal driver adapters.
+    Both paths use Selenium's own visibility predicate and the same evidence contract.
+    """
+    from .dom_inspector import safe_text, safe_href, displayed_atom
+    result, matched = {}, {}
     for key, query in normalize_bindings(bindings, step_id=step_id).items():
         try:
-            nodes = driver.find_elements(LOCATORS[query['by']], query['selector'])
-            if len(nodes) > 200:
-                raise ValueError('More than 200 matches; narrow the locator instead of truncating a count')
-            wrapped = [Element(n, Browser(driver, base_url)) for n in nodes]
-            visible = [n for n in wrapped if n.is_displayed()]
+            locator = LOCATORS[query['by']], query['selector']
+            if locator not in matched:
+                nodes = driver.find_elements(*locator)
+                if len(nodes) > 200:
+                    raise ValueError('More than 200 matches; narrow the locator instead of truncating a count')
+                if batch and nodes:
+                    states = driver.execute_script('const displayed = (' + displayed_atom() + ');' + r'''
+return arguments[0].map(el => ({
+    sensitive:/password|passwd|secret|token|api.?key|credit.?card/i.test(
+        ["type","name","id","autocomplete"].map(k => el.getAttribute(k) || "").join(" ")),
+    visible:displayed(el)
+}));
+''', nodes)
+                    if len(states) != len(nodes):
+                        raise ValueError('Incomplete batch visibility response')
+                    if any(s['sensitive'] for s in states):
+                        raise PermissionError('Sensitive controls are outside this demo')
+                    wrapped = nodes  # Scalar text/state reads still use native WebDriver.
+                    visible = [n for n,s in zip(nodes,states) if s['visible']]
+                else:
+                    wrapped = [Element(n, Browser(driver, base_url)) for n in nodes]
+                    visible = [n for n in wrapped if n.is_displayed()]
+                matched[locator] = nodes, wrapped, visible
+            nodes, wrapped, visible = matched[locator]
             kind, value, status = query['read'], None, 'observed'
             if kind == 'count':
                 value = len(visible)
@@ -216,9 +239,10 @@ def validate_source(source):
 
 
 class Browser:
-    def __init__(self, driver, base_url, *, actions=None, on_action=None):
+    def __init__(self, driver, base_url, *, actions=None, on_action=None, progress=None):
         self._driver, self._origin = driver, origin(base_url)
         self._actions, self._on_action = actions, on_action
+        self._progress = progress if progress is not None else {}
 
     def _url(self):
         from .dom_inspector import diagnostic_url
@@ -228,10 +252,12 @@ class Browser:
             return '[unavailable]'
 
     def _action(self, action, target, fn):
+        self._progress['operation'] = 'action'
         if self._actions is None:
             return fn()
         from .dom_inspector import safe_text
         record = dict(action=action,target=safe_text(target,300),before_url=self._url(),status='started')
+        record.update(self._progress.get('top_level_statement', {}))
         if len(self._actions) >= 200:
             raise ValueError('Action log limit exceeded (200)')
         self._actions.append(record)
@@ -325,14 +351,17 @@ class Element:
                 for e in self._element.find_elements(by, value)[:200]]
 
 
-def execute_source(source, driver, base_url, *, actions=None, on_action=None):
+def execute_source(source, driver, base_url, *, actions=None, on_action=None, progress=None):
     """Interpret a finite Selenium subset; no model Python bytecode execution."""
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
     tree = validate_source(source)
-    browser = Browser(driver, base_url,actions=actions,on_action=on_action)
+    progress = progress if progress is not None else {}
+    progress.update(operation='code', completed_end_line=0, source_complete=False)
+    browser = Browser(driver, base_url,actions=actions if actions is not None else [],
+                      on_action=on_action,progress=progress)
 
     def wait(target, timeout=10, poll_frequency=.2):
         if target is not browser or not isinstance(timeout, (int, float)) or not .1 <= timeout <= 20:
@@ -432,11 +461,16 @@ def execute_source(source, driver, base_url, *, actions=None, on_action=None):
             fn = value(node.func)
             if not callable(fn):
                 raise ValueError('Selenium target is not callable')
-            return fn(*(value(x) for x in node.args), **{k.arg: value(k.value) for k in node.keywords})
+            args = [value(x) for x in node.args]
+            kwargs = {k.arg: value(k.value) for k in node.keywords}
+            progress['operation'] = 'wait' if isinstance(node.func,ast.Attribute) and node.func.attr=='until' else 'code'
+            return fn(*args, **kwargs)
         raise ValueError('Unsupported expression')
 
     def statement_run(statement):
         tick()
+        progress['statement'] = dict(start_line=statement.lineno,end_line=statement.end_lineno)
+        progress['operation'] = 'code'
         if isinstance(statement, ast.Assign):
             env[statement.targets[0].id] = value(statement.value)
         elif isinstance(statement, ast.For):
@@ -453,7 +487,88 @@ def execute_source(source, driver, base_url, *, actions=None, on_action=None):
             raise ValueError('Unsupported statement')
 
     for statement in tree.body:
+        progress['top_level_statement'] = dict(start_line=statement.lineno,end_line=statement.end_lineno,
+            start_column=statement.col_offset,end_column=statement.end_col_offset)
         statement_run(statement)
+        progress['completed_end_line'] = statement.end_lineno
+    progress.update(source_complete=True,operation='complete')
+
+
+def execution_diagnostics(progress, actions, *, stage, entry=None, current=None):
+    """Technical progress only: a returned click is not proof of a business result."""
+    completed = [a for a in actions if a['status'] == 'complete']
+    failed_statement = progress.get('top_level_statement', {})
+    partial = any((a.get('start_line'),a.get('start_column')) ==
+                  (failed_statement.get('start_line'),failed_statement.get('start_column')) for a in completed)
+    operation = 'evidence' if stage == 'evidence' else progress.get('operation', 'preflight')
+    phase = ('complete' if stage == 'complete' else
+             'during_action' if operation == 'action' or any(a['status'] != 'complete' for a in actions) else
+             'after_action' if completed or (stage == 'evidence' and progress.get('source_complete')) else 'before_action')
+    def state(view):
+        return {k: view[k] for k in ('url', 'state_hash', 'observation_ref') if k in (view or {})}
+    before, after = state(entry), state(current)
+    return dict(phase=phase, failed_operation=operation, source_complete=progress.get('source_complete', False),
+                completed_end_line=progress.get('completed_end_line', 0),
+                failed_statement=failed_statement if stage != 'complete' else {},
+                failed_inner_statement=progress.get('statement', {}) if stage != 'complete' else {},
+                successful_actions=len(completed), partial_statement_actions=partial,
+                entry_state=before, current_state=after,
+                state_changed=(before['state_hash'] != after['state_hash']
+                               if before.get('state_hash') and after.get('state_hash') else None),
+                url_changed=(before['url'] != after['url'] if 'url' in before and 'url' in after else None))
+
+
+def validate_wait_repair(source):
+    """A wait patch cannot sneak in a second click, navigation or callable alias."""
+    tree = ast.parse(source)
+    reads = {'until', 'find_element', 'find_elements', 'get_attribute', 'is_displayed',
+             'is_enabled', 'is_selected', 'strip', 'lower', 'presence_of_element_located',
+             'visibility_of_element_located', 'element_to_be_clickable',
+             'invisibility_of_element_located', 'text_to_be_present_in_element'}
+    if not tree.body or any(not isinstance(n, (ast.Expr, ast.Assign)) for n in tree.body):
+        raise ValueError('Wait-only repair requires simple assignments/expressions with an explicit EC wait')
+    waited = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in {'WebDriverWait', 'len'}:
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr not in reads:
+                raise ValueError('Wait-only repair cannot add click/input/navigation or callable aliases; '
+                                 'return only the failed technical wait, successful actions are locked')
+            waited |= node.func.attr == 'until'
+    if not waited:
+        raise ValueError('Wait-only repair must retain an explicit technical EC wait')
+
+
+def step_repair_context(source, result):
+    """Lock completed top-level statements; never split a partly executed if/for."""
+    execution = result.get('execution')
+    if not execution:
+        return None  # Older/unknown records cannot prove a safe local patch boundary.
+    context = dict(execution, original_code=source)
+    if execution.get('source_complete') and execution.get('failed_operation') == 'evidence':
+        return dict(context, scope='bindings', locked_prefix=source)
+    lines = source.splitlines(keepends=True)
+    boundary = execution.get('failed_statement', {})
+    start, end = boundary.get('start_line', 0), boundary.get('end_line', 0)
+    if not 1 <= start <= end <= len(lines):
+        return None
+    def offset(line, column):
+        # AST columns count UTF-8 bytes, not Unicode characters.
+        return sum(len(s) for s in lines[:line-1]) + len(lines[line-1].encode('utf-8')[:column].decode('utf-8'))
+    first = offset(start,boundary.get('start_column',0))
+    last = offset(end,boundary.get('end_column',len(lines[end-1].rstrip().encode('utf-8'))))
+    failed = source[first:last]
+    if execution.get('failed_operation') == 'wait' and not execution.get('partial_statement_actions'):
+        try:
+            validate_wait_repair(failed)
+        except (ValueError, SyntaxError):
+            pass
+        else:
+            return dict(context, scope='wait', locked_prefix=source[:first],
+                        failed_code=failed, locked_suffix=source[last:])
+    return dict(context, scope='tail', locked_prefix=source[:first],
+                failed_code=source[first:], locked_suffix='')
 
 
 def split_program(source):

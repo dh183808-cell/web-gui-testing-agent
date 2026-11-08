@@ -31,6 +31,11 @@ TRUSTED_SCRIPT_IDS = frozenset({'navigate', 'update', 'smoke', 'locator_failure'
                               'wait_timeout', 'browser_exception', 'deadline'})
 # Review gate for the human-authored fixture asset; never calculate approval at runtime.
 REVIEWED_SCRIPT_SHA256 = '68da6297c3c8827b505ec53e99a9654567bc4a2720df52eb8afc89c77a25d5ce'
+CHECKED_PHASES = ('pre_observe', 'script_execute', 'oracle_capture', 'post_observe')
+
+
+def phase_domain(phase):
+    return 'observation' if phase in {'pre_observe', 'post_observe'} else 'oracle' if phase == 'oracle_capture' else 'script'
 
 
 def reviewed_script():
@@ -48,9 +53,12 @@ class RuntimeLimits:
     session_seconds: float = 600
     step_attempts: int = 3
     task_repairs: int = 5
+    observation_seconds: float = 5
+    oracle_seconds: float = 5
 
     def __post_init__(self):
-        for name, low, high in [('execution_seconds', .1, 300), ('startup_seconds', 1, 180),
+        for name, low, high in [('execution_seconds', .1, 300), ('observation_seconds', .1, 30),
+                                ('oracle_seconds', .1, 30), ('startup_seconds', 1, 180),
                                 ('session_seconds', 1, 1800), ('step_attempts', 1, 3), ('task_repairs', 0, 5)]:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
@@ -58,6 +66,23 @@ class RuntimeLimits:
         for name in ('step_attempts', 'task_repairs'):
             if not isinstance(getattr(self, name), int):
                 raise ValueError(f'{name} must be an integer')
+
+    def checked_phase_limits(self):
+        return dict(pre_observe=self.observation_seconds, script_execute=self.execution_seconds,
+                    oracle_capture=self.oracle_seconds, post_observe=self.observation_seconds)
+
+
+class RuntimePhaseTimeout(TimeoutError):
+    def __init__(self, phase, partial, elapsed, scope='phase'):
+        super().__init__(f'{phase} exceeded its {scope} deadline')
+        self.partial = dict(partial)
+        self.partial.update(failed_phase=phase, failure_domain=phase_domain(phase), timeout_scope=scope)
+        self.partial['timings'] = dict(partial.get('timings',{}), **{phase:round(elapsed,3)})
+        self.partial['phase_status'] = dict(partial.get('phase_status',{}), **{phase:'TIMEOUT'})
+        if phase == 'script_execute':
+            self.partial['script_status'] = 'TIMEOUT'
+        elif phase == 'oracle_capture':
+            self.partial['oracle_status'] = 'TIMEOUT'
 
 
 class LocalRuntimeUnavailable(RuntimeError):
@@ -239,10 +264,43 @@ class LocalSession:
                     raise TimeoutError('Managed session deadline exceeded')
             self._proc.stdin.write(json.dumps(payload) + '\n')
             self._proc.stdin.flush()
-            try:
-                result = self._responses.get(timeout=timeout)
-            except queue.Empty:
-                raise TimeoutError('Managed execution deadline exceeded') from None
+            phase_limits = payload.get('phase_limits')
+            started = time.monotonic()
+            request_deadline = started + timeout
+            phase, phase_started = 'pre_observe', started
+            partial = dict(timings=dict.fromkeys(CHECKED_PHASES,0.0),
+                           phase_status=dict.fromkeys(CHECKED_PHASES,'NOT_RUN'),
+                           script_status='NOT_RUN',oracle_status='NOT_RUN')
+            phase_deadline = started + phase_limits[phase] if phase_limits else request_deadline
+            seen = set()
+            while True:
+                deadline = min(request_deadline, phase_deadline)
+                if self._expires is not None and payload.get('op') != 'close':
+                    deadline = min(deadline,self._expires)
+                remaining = deadline - time.monotonic()
+                try:
+                    if remaining <= 0:
+                        raise queue.Empty()
+                    result = self._responses.get(timeout=remaining)
+                except queue.Empty:
+                    if phase_limits:
+                        now = time.monotonic()
+                        scope = 'session' if self._expires is not None and now >= self._expires else (
+                            'request' if now >= request_deadline else 'phase')
+                        raise RuntimePhaseTimeout(phase,partial,now-phase_started,scope) from None
+                    raise TimeoutError('Managed execution deadline exceeded') from None
+                if not phase_limits or '_runtime_phase' not in result:
+                    break
+                name = result['_runtime_phase']
+                if name not in phase_limits:
+                    raise LocalRuntimeUnavailable('Unknown Worker phase')
+                if result['event'] == 'started':
+                    if name in seen or CHECKED_PHASES.index(name) < CHECKED_PHASES.index(phase):
+                        raise LocalRuntimeUnavailable('Invalid Worker phase order')
+                    seen.add(name)
+                    phase, phase_started = name, time.monotonic()
+                    phase_deadline = phase_started + phase_limits[name]
+                partial = result['partial']
             if result.get('error_type') == 'WorkerExited':
                 raise LocalRuntimeUnavailable(result['error'])
             return result
@@ -255,7 +313,7 @@ class LocalSession:
     def observe(self, *, screenshot=False, **options):
         try:
             result = self._request({'op': 'observe', 'options': options, 'screenshot': screenshot},
-                                   self.limits.execution_seconds)
+                                   self.limits.observation_seconds)
             if result['status'] != 'COMPLETE':
                 raise RuntimeError(result.get('error_type', 'Observation failed'))
             return self._remember(result['observation'])
@@ -284,8 +342,9 @@ class LocalSession:
             validate_source(source)
             queries = normalize_bindings(queries, step_id=step_id)
             result['script_sha256'] = hashlib.sha256(source.encode()).hexdigest()
+            phase_limits = self.limits.checked_phase_limits()
             response = self._request({'op': 'checked', 'source': source, 'step_id': step_id,
-                                      'queries': queries}, self.limits.execution_seconds)
+                                      'queries': queries, 'phase_limits':phase_limits}, sum(phase_limits.values()))
             observation = response.pop('observation', None)
             result.update(response)
             if observation:
@@ -294,8 +353,11 @@ class LocalSession:
         except (ValueError, SyntaxError) as exc:
             result.update(status='REJECTED', error_type=type(exc).__name__, error=str(exc)[:1200])
         except Exception as exc:
+            if isinstance(exc,RuntimePhaseTimeout):
+                result.update(exc.partial)
             result.update(status='TIMEOUT' if isinstance(exc, TimeoutError) else 'ERROR',
-                          error_type=type(exc).__name__, error='Research Worker request failed')
+                          error_type=type(exc).__name__,
+                          error=str(exc) if isinstance(exc,RuntimePhaseTimeout) else 'Research Worker request failed')
             self.close_session(graceful=False)
         result.update(elapsed_seconds=round(time.monotonic()-started, 3), cleanup=dict(self.cleanup))
         self._write('execution_' + result['execution_id'] + '.json', result)
@@ -318,6 +380,8 @@ class LocalSession:
                     script_sha256=hashlib.sha256(source.encode()).hexdigest(),
                     session_id=self.session_id, browser_session_id=self.metadata['browser_session_id'],
                     purpose=self.purpose, steps=results,
+                    timings={phase:round(sum(r.get('timings',{}).get(phase,0) for r in results),3)
+                             for phase in CHECKED_PHASES},
                     measurements={key: v for r in results for key,v in r.get('measurements',{}).items()})
 
     def execute_trusted(self, script_id: str):

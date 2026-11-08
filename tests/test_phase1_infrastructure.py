@@ -149,8 +149,9 @@ def test_observe_existing_session_detects_same_url_change_without_quit():
         title, current_window_handle, window_handles = 'Fixture', 'window-1', ['window-1']
         def find_elements(self, *args):
             return []
-        def execute_script(self, source):
-            return True if 'window.top' in source else 'complete'
+        def execute_script(self, source, *args):
+            return dict(html=self.page_source, live=[], url=self.current_url, title=self.title,
+                        frame_context='top',ready_state='complete',truncated=False)
         def quit(self):
             pytest.fail('Inspector closed an existing session')
     driver = Driver()

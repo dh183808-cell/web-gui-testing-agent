@@ -229,7 +229,7 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
     """Dynamic branch in the existing Pipeline; six Agents retain their roles."""
     import hashlib
     import time
-    from .checked_selenium import origin
+    from .checked_selenium import origin, step_repair_context
     from .selenium_runtime import create_session, RuntimeLimits, ARTIFACT_ROOT
     from .agents.generator import Agent3SeleniumGenerator
     from .schema import validate_dynamic_plan
@@ -275,8 +275,9 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
               cleanup=cleanup)
         return cleanup
 
-    def observe(s):
-        view = dict(s.observe(max_elements=80, max_html=16000))
+    def observe(s, saved_ref=None):
+        view = (json.loads((s.run_dir / saved_ref).read_text(encoding='utf-8')) if saved_ref
+                else dict(s.observe(max_elements=80, max_html=16000)))
         ref = view.get('html_ref')
         if ref:
             view['html_summary'] = (s.run_dir / ref).read_text(encoding='utf-8')[:16000]
@@ -285,9 +286,11 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
     def fail(stage_name, failure):
         diagnosis = Agent6RecoveryController().diagnose_dynamic(stage=stage_name, result=failure, repairs=repairs)
         write('agent6_diagnosis.json', diagnosis)
-        event('Agent6', 'diagnosed_stop', error_type=failure.get('error_type'))
+        event('Agent6', 'diagnosed_stop', error_type=failure.get('error_type'),
+              failed_phase=failure.get('failed_phase'),failure_domain=failure.get('failure_domain'))
         verdict = dict(status='ERROR', message='Technical run incomplete; no business PASS/FAIL',
                        error_type=failure.get('error_type'), failed_stage=stage_name, checks=[])
+        verdict.update({k:failure[k] for k in ('failed_phase','failure_domain','script_status') if k in failure})
         write('final_verdict.json', verdict)
         return dict(verdict=verdict, run_dir=str(run_dir), report=str(run_dir/'report.md'))
 
@@ -336,7 +339,7 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         trial = session('trial','incremental_development')
         observation = observe(trial)
         implementation, bindings, debug = [], {}, []
-        checkpoints = {}
+        checkpoints, step_entries = {}, {}
         cold_error = None
         review_feedback = {}
         while True:
@@ -345,16 +348,48 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                 step = contract['steps'][index]
                 error = review_feedback.pop(step['id'], None) or cold_error
                 previous = (error or {}).get('previous_proposal')
+                entry_observation = (error or {}).get('entry_observation') or observation
+                failure_observation = observation if cold_error else None
+                repair_context = step_repair_context(previous['code'],error) if previous and error else None
+                restore_entry = bool((error or {}).get('restore_entry'))
+                entry_replayed = False
                 cold_error = None
                 while True:
+                    if attempts.get(step['id'],0) >= step_attempts:
+                        return fail('Agent3',dict(error_type='StepBudgetExhausted',step_id=step['id'],
+                                                 cause=error))
+                    if restore_entry:
+                        # The failed page is diagnostic data, never the entry for a
+                        # replacement step. Restore using the SAME saved prefix.
+                        close(trial,'failed_step_entry_restore')
+                        trial = session('trial','failed_step_entry_restore')
+                        prefix_ids = [s['id'] for s in implementation]
+                        prefix_bindings = {k:v for k,v in bindings.items() if v['step_id'] in prefix_ids}
+                        if implementation:
+                            prefix = ''.join('# webagent-step: '+s['id']+'\n'+s['source']+'\n\n' for s in implementation)
+                            replay = trial.execute_program(prefix,step_ids=prefix_ids,bindings=prefix_bindings)
+                            replay_ref = 'step_entry_replay_'+uuid.uuid4().hex[:8]+'.json'
+                            write(replay_ref,replay)
+                            if replay['execution_status'] != 'COMPLETE':
+                                return fail('Agent3EntryReplay',replay['steps'][-1])
+                        observation = observe(trial)
+                        entry_observation = observation
+                        restore_entry = False
+                        entry_replayed = True
+                        event('Agent3','step_entry_restored',step_id=step['id'],prefix_steps=prefix_ids,
+                              observation_ref=observation.get('observation_ref'))
+                    step_entries[step['id']] = entry_observation
+                    if repair_context:
+                        repair_context = dict(repair_context,current_at_step_entry=True,
+                            entry_validation='saved_prefix_replay' if entry_replayed else 'unchanged_observed_state')
                     attempts[step['id']] = attempts.get(step['id'],0)+1
-                    if attempts[step['id']] > step_attempts:
-                        return fail('Agent3',error or dict(error_type='StepBudgetExhausted',step_id=step['id']))
                     name = 'agent3_' + step['id'] + '_' + uuid.uuid4().hex[:8]
                     event('Agent3','generate_step',step_id=step['id'],attempt=attempts[step['id']])
                     try:
                         proposal = generator.develop_step(contract,step,observation,llm=llm,
-                                                          previous=previous,error=error,proposal_path=run_dir/(name+'.json'))
+                            previous=previous,error=error,proposal_path=run_dir/(name+'.json'),
+                            entry_observation=entry_observation,failure_observation=failure_observation,
+                            repair_context=repair_context)
                         source = proposal['code']
                         previous = proposal
                         (run_dir/(name+'.py')).write_text(source,encoding='utf-8')
@@ -362,7 +397,13 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                         result = trial.execute_checked(source,step_id=step['id'],queries=proposal['bindings'])
                         event('Runtime','step_executed',step_id=step['id'],phase='development',
                               status=result['status'],session_id=result.get('session_id'),
-                              current_url=result.get('current_url'),actions=result.get('actions',[]))
+                              current_url=result.get('current_url'),actions=result.get('actions',[]),
+                              execution=result.get('execution'),timings=result.get('timings'),
+                              failed_phase=result.get('failed_phase'),script_status=result.get('script_status'))
+                        if result['status'] != 'COMPLETE':
+                            entry_ref = result.get('execution',{}).get('entry_state',{}).get('observation_ref')
+                            if entry_ref:
+                                entry_observation = observe(trial,entry_ref)
                     except (ValueError,SyntaxError) as exc:
                         # develop_step saves the raw proposal before validating it. Keep
                         # rejected code AND bindings available to the next repair call.
@@ -372,7 +413,9 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                         result = dict(status='REJECTED',error_type=type(exc).__name__,error=str(exc)[:1200],
                                       step_id=step['id'])
                     debug.append(dict(step_id=step['id'],attempt=attempts[step['id']],proposal_ref=name,
-                                      result=result))
+                        result=result,repair_context=repair_context,
+                        entry_observation_ref=entry_observation.get('observation_ref'),
+                        failure_observation_ref=(failure_observation or {}).get('observation_ref')))
                     write('agent3_debug.json',debug)
                     if result['status']=='COMPLETE':
                         implementation.append(dict(id=step['id'],source=source))
@@ -383,12 +426,28 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                               observation_ref=result.get('observation_ref'))
                         break
                     error = result
-                    if attempts[step['id']] >= step_attempts or repairs >= task_repairs or result['status']=='TIMEOUT':
+                    if (attempts[step['id']] >= step_attempts or repairs >= task_repairs
+                            or result['status']=='TIMEOUT' or result.get('failure_domain')=='observation'):
                         return fail('Agent3',result)
                     repairs += 1
                     observation = observe(trial)
+                    if result['status'] != 'REJECTED':
+                        failure_observation = observation
+                        repair_context = step_repair_context(source,result)
+                        execution = result.get('execution',{})
+                        # Even a timed-out action may have reached the server. Only
+                        # reuse the current entry when unchanged state is observed
+                        # and no mutating action has been attempted. Unknown => reset.
+                        restore_entry = bool(result.get('actions')) or execution.get('state_changed') is not False
+                    if (observation.get('state_hash') and entry_observation.get('state_hash')
+                            and observation['state_hash'] != entry_observation['state_hash']):
+                        restore_entry = True
                     event('Agent3','repair_from_actual_error',step_id=step['id'],repairs=repairs,
-                          error_type=result.get('error_type'))
+                          error_type=result.get('error_type'),
+                          execution_phase=(result.get('execution') or {}).get('phase'),
+                          repair_scope=(repair_context or {}).get('scope','whole_step'),
+                          current_matches_entry=(result.get('execution') or {}).get('state_changed') is False,
+                          restore_entry_required=restore_entry)
             path, digest = generator.freeze_dynamic(implementation,run_dir=run_dir)
             stage = 'Agent2Implementation'
             review = Agent2TestReviewer().review_implementation(contract,implementation,bindings,
@@ -443,7 +502,7 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                     if not contract:
                         return fail('Agent2',failure)
                     contract_hash = freeze_contract(contract)
-                    implementation, bindings, review_feedback, checkpoints = [], {}, {}, {}
+                    implementation, bindings, review_feedback, checkpoints, step_entries = [], {}, {}, {}, {}
                     trial = session('trial','semantic_revision')
                     observation = observe(trial)
                     continue
@@ -478,13 +537,19 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                 close(cold,'cold_trial_finished')
                 break
             failed = replay['steps'][-1]
-            if repairs >= task_repairs or failed['status']=='TIMEOUT':
+            if (repairs >= task_repairs or failed['status']=='TIMEOUT'
+                    or failed.get('failure_domain')=='observation'):
                 return fail('Agent3ColdTrial',failed)
             failed_index = len(replay['steps'])-1
+            sid = implementation[failed_index]['id']
+            if attempts.get(sid,0) >= step_attempts:
+                return fail('Agent3ColdTrial',dict(error_type='StepBudgetExhausted',step_id=sid,cause=failed))
             repairs += 1
+            entry_ref = failed.get('execution',{}).get('entry_state',{}).get('observation_ref')
             failed = dict(failed, previous_proposal=dict(code=implementation[failed_index]['source'],
                           bindings={key:v for key,v in bindings.items()
-                                    if v['step_id']==implementation[failed_index]['id']}))
+                                    if v['step_id']==sid}),restore_entry=True,
+                          entry_observation=observe(cold,entry_ref) if entry_ref else step_entries.get(sid,{}))
             implementation = implementation[:failed_index]
             bindings = {key:v for key,v in bindings.items() if v['step_id'] in [s['id'] for s in implementation]}
             trial, cold_error = cold, failed
