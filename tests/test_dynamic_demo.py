@@ -232,9 +232,10 @@ def test_pipeline_repair_receives_rejected_code_and_binding(tmp_path, monkeypatc
             data = json.loads(user)
             if 'Agent1' in system:
                 return dict(steps=[dict(id='S1',goal='Read the choice')],
-                    oracles=[dict(id='O1',step_id='S1',meaning='choice state',kind='equals',expected=False)])
+                    oracles=[dict(id='O1',step_id='S1',meaning='choice state',kind='equals',expected=False,
+                                  source_type='user_requirement',source_quote='not selected')])
             if 'Agent2' in system:
-                return dict(approved=True,issues=[])
+                return dict(approved=True,input_status='consistent',issues=[])
             model_calls.append(data)
             if len(model_calls)==1:
                 return dict(code='driver.title',bindings={'O1':dict(selector='XPATH',xpath='//input',read='selected',step_id='S1')})
@@ -259,7 +260,7 @@ def test_pipeline_repair_receives_rejected_code_and_binding(tmp_path, monkeypatc
             return dict(process_tree_terminated=True,profile_removed=True)
     monkeypatch.setattr(runtime,'ARTIFACT_ROOT',tmp_path)
     monkeypatch.setattr(runtime,'create_session',lambda *a,purpose,**kw: FakeSession(purpose))
-    result = run_pipeline(target='dynamic',mode='llm',requirement='Read the choice',start_url='https://authorized.test/',
+    result = run_pipeline(target='dynamic',mode='llm',requirement='Read the choice and verify it is not selected',start_url='https://authorized.test/',
                           allow_live_site=True,allow_local_research=True,output_root=tmp_path,llm=FakeLLM())
     assert result['verdict']['status']=='PASS' and len(model_calls)==2
     debug = json.loads((Path(result['run_dir'])/'agent3_debug.json').read_text())

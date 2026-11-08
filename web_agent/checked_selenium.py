@@ -33,7 +33,7 @@ OBSERVED_ATTRIBUTES = frozenset({'id', 'name', 'type', 'value', 'class', 'href',
     'data-testid', 'disabled', 'selected', 'role', 'placeholder', 'target', 'formtarget'})
 LOCATORS = {'css': 'css selector', 'css selector': 'css selector', 'css_selector': 'css selector',
             'xpath': 'xpath', 'id': 'id', 'name': 'name'}
-READS = {'count', 'text', 'texts', 'selected', 'selected_text', 'visible', 'enabled', 'attribute', 'exists', 'visible_exists'}
+READS = {'count', 'text', 'texts', 'selected', 'selected_text', 'visible', 'enabled', 'attribute', 'exists', 'visible_exists', 'target_present'}
 TEXT_LIMIT = 2_000_000
 
 
@@ -58,7 +58,11 @@ e.g. value="all" with label "All fields" returns "All fields", not "all".
 Missing/hidden select or missing/ambiguous selected options are UNKNOWN. Target the
 select itself. selected_value is NOT supported. attribute(value) is the internal value;
 text on a specific selected option is also supported for its label.
-No implicit count-to-bool or string-to-number conversion. At most 200 matches.'''
+No implicit count-to-bool or string-to-number conversion. At most 200 matches.
+For a frozen named required target, use {read:"target_present",target:{role:"button",
+name:"source name"},step_id:"S2"}, with NO by/selector. Only this trusted full-control
+inventory plus bounded waiting can support an absence claim; locator misses cannot.
+Incomplete context, unsupported naming, frames or shadow roots yield UNKNOWN.'''
 
 
 def normalize_bindings(bindings, *, step_id=None, expected_ids=None):
@@ -76,6 +80,15 @@ def normalize_bindings(bindings, *, step_id=None, expected_ids=None):
             raise ValueError(prefix + ': ' + message)
         if not isinstance(query, dict):
             invalid('binding must be an object: by, selector, read, step_id')
+        if query.get('read') == 'target_present':
+            from .schema import validate_target
+            if set(query) != {'read','target','step_id'} or not isinstance(query.get('step_id'),str):
+                invalid('target_present requires ONLY read, target, step_id (no locator)')
+            if step_id is not None and query['step_id'] != step_id:
+                invalid(f'step_id must match current step {step_id}')
+            validate_target(query.get('target'))
+            result[key] = deepcopy(query)
+            continue
         extra = set(query) - {'by', 'selector', 'read', 'step_id', 'attribute'}
         if extra:
             invalid(f'unsupported fields {sorted(extra)}; use by="xpath", selector="//input[@id=\'item\']", '
@@ -105,6 +118,92 @@ def normalize_bindings(bindings, *, step_id=None, expected_ids=None):
     return result
 
 
+def probe_target(driver, target, *, wait_seconds=2.0, poll_seconds=.2):
+    """Bounded negative evidence, independent of a model-generated locator.
+
+    Deliberately conservative: top-level light DOM, one window, supported named
+    native/ARIA controls. A locator timeout or unsupported context is never false.
+    """
+    from .dom_inspector import displayed_atom, diagnostic_url, safe_text
+    from .schema import validate_target
+    validate_target(target)
+    started = time.monotonic()
+    samples, inventories, last = [], [], None
+    entry_handle = driver.current_window_handle
+    script = 'const displayed = (' + displayed_atom() + ');' + r'''
+const wanted=arguments[0], norm=s=>(s||'').replace(/\s+/g,' ').trim();
+const all=Array.from(document.querySelectorAll('*'));
+const reasons=[];
+if(all.length>30000) reasons.push('dom_limit');
+if(document.querySelector('iframe,frame')) reasons.push('frames_not_inspected');
+if(all.some(e=>e.shadowRoot)) reasons.push('shadow_roots_not_inspected');
+function role(e) {
+ const explicit=e.getAttribute('role'); if(explicit) return explicit;
+ const t=e.tagName, k=(e.getAttribute('type')||'text').toLowerCase();
+ if(t==='BUTTON'||(t==='INPUT'&&['button','submit','reset','image'].includes(k))) return 'button';
+ if(t==='A'&&e.hasAttribute('href')) return 'link';
+ if(t==='SELECT') return 'combobox';
+ if(t==='TEXTAREA'||(t==='INPUT'&&['text','search','email','url','tel'].includes(k))) return 'textbox';
+ if(t==='INPUT'&&['checkbox','radio'].includes(k)) return k;
+ return '';
+}
+function name(e) {
+ const ids=e.getAttribute('aria-labelledby');
+ if(ids) {
+   const labels=ids.trim().split(/\s+/).map(id=>document.getElementById(id));
+   if(labels.some(x=>!x)) reasons.push('unresolved_aria_label');
+   return norm(labels.map(x=>x?x.textContent:'').join(' '));
+ }
+ if(e.hasAttribute('aria-label')) return norm(e.getAttribute('aria-label'));
+ if(e.labels && e.labels.length) return norm(Array.from(e.labels).map(l=>l.innerText).join(' '));
+ if(e.tagName==='INPUT'&&['button','submit','reset'].includes(e.type)) return norm(e.value);
+ return norm(e.innerText||e.getAttribute('alt')||e.getAttribute('title')||'');
+}
+const controls=[];
+for(const e of all) {
+ if(role(e)!==wanted.role) continue;
+ const visible=displayed(e), label=name(e);
+ if(visible&&!label) reasons.push('unnamed_candidate');
+ if(label.length>500) reasons.push('name_limit');
+ controls.push({tag:e.tagName.toLowerCase(),id:e.id,role:wanted.role,
+   name:label.slice(0,500),visible,type:e.getAttribute('type')});
+}
+if(controls.length>500) reasons.push('inventory_limit');
+const found=controls.filter(e=>e.visible&&norm(e.name)===norm(wanted.name));
+return {url:location.href,title:document.title,ready_state:document.readyState,
+  controls:controls.slice(0,500),found:found.length,total_controls:controls.length,
+  dom_nodes:all.length,reasons:Array.from(new Set(reasons)),
+  page_context:!!document.body&&!!document.querySelector('h1,h2,form,main,[role=main]')};
+'''
+    while True:
+        row = driver.execute_script(script, target)
+        handles = driver.window_handles
+        if len(handles) != 1 or driver.current_window_handle != entry_handle:
+            row['reasons'].append('window_context_unresolved')
+        row['url'] = diagnostic_url(row['url'])
+        row['title'] = safe_text(row['title'],200)
+        for control in row['controls']:
+            control['name'] = safe_text(control['name'],500)
+        samples.append(dict(url=row['url'],ready_state=row['ready_state'],found=row['found'],
+                            elapsed_seconds=round(time.monotonic()-started,3)))
+        inventories.append(row['controls'])
+        last = row
+        if row['found'] or time.monotonic()-started >= wait_seconds:
+            break
+        time.sleep(poll_seconds)
+    stable = (len(samples)>=3 and all(s['ready_state']=='complete' and s['url']==samples[0]['url'] for s in samples)
+              and all(items==inventories[0] for items in inventories)
+              and time.monotonic()-started >= wait_seconds)
+    complete = not last['reasons'] and last['page_context'] and stable
+    observed = bool(last['found']) or complete
+    return dict(value=bool(last['found']) if observed else None,
+                status='observed' if observed else 'absence_unconfirmed',
+                absence_confirmed=observed and not last['found'],inventory_complete=complete,
+                target=target,probe=dict(method='named_control_inventory',scope='top_level_light_dom',
+                    wait_seconds=wait_seconds,elapsed_seconds=round(time.monotonic()-started,3),
+                    samples=samples,context_stable=stable,current_window=entry_handle,**last))
+
+
 def collect_measurements(driver, base_url, bindings, *, step_id=None, batch=False,
                          on_progress=None, completed=None):
     """Worker batches rendered text; counts never read text. No silent truncation.
@@ -119,6 +218,8 @@ def collect_measurements(driver, base_url, bindings, *, step_id=None, batch=Fals
     started = time.monotonic()
 
     def cache_key(query):
+        if query['read'] == 'target_present':
+            return 'target_present', query['target']['role'], query['target']['name'], query['step_id']
         return LOCATORS[query['by']], query['selector'], query['read'], query.get('attribute'), query['step_id']
 
     groups = {}
@@ -129,7 +230,7 @@ def collect_measurements(driver, base_url, bindings, *, step_id=None, batch=Fals
         def notify(operation, event, mark, **extra):
             if on_progress:
                 on_progress(dict(oracle_id=key, oracle_ids=groups[cache_key(query)],
-                    step_id=query['step_id'], by=query['by'], selector=safe_text(query['selector'],1000),
+                    step_id=query['step_id'], by=query.get('by'), selector=safe_text(query.get('selector',''),1000),
                     read=query['read'], attribute=query.get('attribute'), operation=operation, event=event,
                     started_seconds=round(mark-started,4), elapsed_seconds=round(time.monotonic()-mark,4), **extra))
 
@@ -173,6 +274,13 @@ def collect_measurements(driver, base_url, bindings, *, step_id=None, batch=Fals
             return rows
 
         try:
+            if query['read'] == 'target_present':
+                measurement_key = cache_key(query)
+                if measurement_key not in measurements:
+                    measurements[measurement_key] = run('target_inventory', lambda: probe_target(driver,query['target']))
+                result[key] = dict(query, **deepcopy(measurements[measurement_key]))
+                notify('measurement','observed',time.monotonic(),status=result[key]['status'])
+                continue
             locator = LOCATORS[query['by']], query['selector']
             # Scope is ONE collection only. Different reads/attributes/steps never
             # share values, even when their locator happens to be identical.

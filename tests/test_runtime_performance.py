@@ -279,8 +279,9 @@ def test_pipeline_does_not_regenerate_successful_code_after_observation_error(tm
         def complete_json(self,system,user):
             if system.startswith('You are Agent1'):
                 return dict(steps=[dict(id='S1',goal='Read state')],oracles=[dict(id='O1',
-                    step_id='S1',kind='gte',expected=1,meaning='at least one')])
-            if system.startswith('You are Agent2'): return dict(approved=True,issues=[])
+                    step_id='S1',kind='gte',expected=1,meaning='at least one',
+                    source_type='user_requirement',source_quote='at least one item')])
+            if system.startswith('You are Agent2'): return dict(approved=True,input_status='consistent',issues=[])
             generated.append(1)
             return dict(code='driver.title',bindings={'O1':dict(selector='.item',read='count',step_id='S1')})
     failure=dict(status='ERROR',error_type='RuntimeError',failed_phase='post_observe',
@@ -293,7 +294,7 @@ def test_pipeline_does_not_regenerate_successful_code_after_observation_error(tm
         def close_session(self): return dict(process_tree_terminated=True,profile_removed=True)
     monkeypatch.setattr(runtime,'ARTIFACT_ROOT',tmp_path)
     monkeypatch.setattr(runtime,'create_session',lambda *a,purpose,**kw:Session(purpose))
-    result=run_pipeline(target='dynamic',mode='llm',start_url='https://authorized.test/',requirement='Read state',
+    result=run_pipeline(target='dynamic',mode='llm',start_url='https://authorized.test/',requirement='Read state and verify at least one item',
         allow_local_research=True,allow_live_site=True,output_root=tmp_path,llm=Model())
     assert result['verdict']['status']=='ERROR' and len(generated)==1
     assert result['verdict']['failed_phase']=='post_observe' and result['verdict']['script_status']=='COMPLETE'

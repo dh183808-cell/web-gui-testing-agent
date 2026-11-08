@@ -8,6 +8,28 @@ configured on the trusted control side, run:
 .\.venv\Scripts\python.exe run_demo.py --target dynamic --mode llm --provider deepseek --url 'https://demo.playwright.dev/todomvc/' --allow-live-site --allow-local-research --requirement 'Add Read book and Write tests. Complete Read book, check it is completed, select Active and verify only Write tests remains.'
 ```
 
+动态入口现在区分可选的纯文本测试依据 --test-basis 与本次测试需求
+--requirement。Agent2 在启动浏览器前审核冲突和 Oracle 来源；矛盾或预期不明确
+返回 INCONCLUSIVE，不会交给 Agent3 强行调试。省略测试依据的旧命令仍可用，
+其结论仅针对用户明确的验收条件，不代表说明书符合性。
+
+可以先用已有 --only-generate 只生成、审核并保存契约（仍调用所选模型，但不启动
+Chrome，也不产生业务 PASS）。以下是**人工构造的演示依据，并非 arXiv 官方规格**：
+
+~~~powershell
+$basis = '演示验收标准：搜索时应采用用户主动选择的字段。本次指定关键词应至少有一条可见结果。'
+$requirement = '选择 All fields，搜索 GUI Agent，检查搜索结果数量。'
+.\.venv\Scripts\python.exe run_demo.py --target dynamic --mode llm --provider deepseek --url 'https://arxiv.org/search/advanced' --allow-live-site --allow-local-research --test-basis $basis --requirement $requirement --only-generate
+~~~
+
+查看新运行目录中的 test_inputs.json、input_review.json、test_contract.json。
+每条 Oracle 记录 source_type（test_basis / user_requirement）、source_quote
+及可信控制侧计算的 source_span（从零开始的字符区间 [start,end) 和从一开始的
+line）。初始输入冲突时不会生成获准的 test_contract.json。删除
+--only-generate 重新启动完整任务时，会重新规划、审核，再进入现有 Agent3～5 流程，
+不会自动恢复上一次仅规划的运行。当前新增测试依据仅用于
+--target dynamic；旧固定模板入口保持原行为，不解析 Word/PDF。
+
 The model writes actual Selenium Python in a capability-limited subset; the local
 Worker does not receive API credentials. This is not an OS sandbox. See the local
 Chinese report `docs/v04_phase2_demo_acceptance.md` for actual evidence and limits:

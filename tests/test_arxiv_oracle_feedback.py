@@ -89,11 +89,11 @@ def test_planning_provenance_and_active_choice_prompts():
             assert 'exact text/heading' in system and 'source_quote' in system
             assert 'gte' in system
             return dict(steps=[dict(id='S1',goal='Set All fields and search')],
-                oracles=[dict(oracle(),source_quote='at least one')])
+                oracles=[dict(oracle(),source_type='user_requirement',source_quote='at least one')])
     draft=Agent1TestDesigner().design_dynamic('Set All fields, search and show at least one result',
         url='https://authorized.test/',llm=Model())
     assert draft['oracles'][0]['expected']==1
-    broken=dict(draft,oracles=[dict(oracle(),source_quote='invented request')])
+    broken=dict(draft,oracles=[dict(oracle(),source_type='user_requirement',source_quote='invented request')])
     with pytest.raises(ValueError,match='source_quote'):
         validate_dynamic_plan(broken)
 
@@ -153,13 +153,14 @@ def test_feedback_routes_to_owner_once_and_preserves_versions(tmp_path,monkeypat
                 if self.plans==2:
                     assert category=='planning' and 'requested comparison' in str(data['review_feedback'])
                 return dict(steps=[dict(id='S1',goal='Prepare page'),dict(id='S2',goal='Count results')],
-                    oracles=[oracle('equals' if category=='planning' and self.plans==1 else 'gte',1,'S2')])
+                    oracles=[dict(oracle('equals' if category=='planning' and self.plans==1 else 'gte',1,'S2'),
+                                  source_type='user_requirement',source_quote='at least one result')])
             if system.startswith('You are Agent2 reviewing'):
                 self.audits+=1
                 return dict(approved=False if self.audits==1 or repeat else True,
                     issue_type=category,step_ids=['S2'],issues=['requested comparison / locator needs repair'])
             if system.startswith('You are Agent2'):
-                return dict(approved=True,issues=[])
+                return dict(approved=True,input_status='consistent',issues=[])
             self.developer_calls.append(data)
             if data['current_step']['id']=='S2' and category=='implementation' and self.audits:
                 assert data['previous_code']=='driver.title'
