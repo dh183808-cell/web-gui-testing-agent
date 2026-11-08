@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from web_agent import selenium_runtime as runtime
-from web_agent.checked_selenium import collect_measurements
+from web_agent.checked_selenium import collect_measurements, rendered_text_script
 from web_agent.dom_inspector import observe_session
 from web_agent.local_worker import checked_execution
 
@@ -56,6 +56,75 @@ def test_count_batch_does_not_read_text_or_per_element_properties_and_reuses_loc
     assert [values[k]['value'] for k in queries]==[25,True,True]
     assert calls==[('find',('css selector','.item')),('batch',50)]
     assert values['count']['matched']==50 and values['count']['visible']==25
+
+
+@pytest.mark.parametrize('batch',[False,True])
+def test_duplicate_body_measurements_are_read_once_with_independent_oracles(batch):
+    reads = []
+    text = 'First fact; Second fact. ' + 'synthetic large body ' * 5000
+    class Body:
+        def get_attribute(self,name): return ''
+        def is_displayed(self): return True
+        @property
+        def text(self):
+            reads.append('text')
+            if len(reads)>1: pytest.fail('Second large body text read would exhaust the Oracle deadline')
+            return text
+    def script(source,*args):
+        if source == rendered_text_script():
+            reads.append('batch_text')
+            return [dict(text=text,status='observed',text_complete=True,text_method='rendered_dom')]
+        return [dict(visible=True,sensitive=False)]
+    driver = SimpleNamespace(find_elements=lambda *a:[Body()],
+        execute_script=script)
+    bindings = {key:dict(by='css',selector='article',read='text',step_id='S1') for key in ('O1','O2')}
+    result = collect_measurements(driver,'https://authorized.test/',bindings,batch=batch)
+    assert reads == (['batch_text'] if batch else ['text'])
+    assert result['O1']['value'] == result['O2']['value']
+    assert result['O1']['value'] == text  # Complete evidence, not an arbitrary 1000-char prefix.
+    assert result['O1'] is not result['O2']
+    result['O1']['oracle_note'] = 'independent'
+    assert 'oracle_note' not in result['O2']
+    for item in result.values(): item.update(observation_ref='snapshot.json',screenshot_ref='snapshot.png')
+    from web_agent.agents.verifier import Agent5EvidenceVerifier
+    contract = {'oracles':[dict(id=key,step_id='S1',kind='contains',expected=expected,meaning=expected)
+        for key,expected in [('O1','First fact'),('O2','absent fact')]]}
+    verdict = Agent5EvidenceVerifier().verify_dynamic(contract,dict(execution_status='COMPLETE',measurements=result))
+    assert verdict.status == 'FAIL'
+    assert [c['passed'] for c in verdict.checks] == [True,False]  # Independent conditions, same actual sample.
+
+
+def test_measurement_cache_is_not_shared_across_steps_reads_attributes_or_collections():
+    calls = []
+    class Node:
+        def get_attribute(self,name): calls.append(name);return name
+        def is_displayed(self): return True
+        @property
+        def text(self): calls.append('text');return 'text sample'
+    driver = SimpleNamespace(find_elements=lambda *a:[Node()],
+        execute_script=lambda source,*a: (calls.append('text') or [
+            dict(text='text sample',status='observed',text_complete=True,text_method='rendered_dom')])
+            if source == rendered_text_script() else [dict(visible=True,sensitive=False)])
+    queries = {
+        'text1':dict(selector='article',read='text',step_id='S1'),
+        'text2':dict(selector='article',read='text',step_id='S2'),
+        'texts':dict(selector='article',read='texts',step_id='S1'),
+        'class':dict(selector='article',read='attribute',attribute='class',step_id='S1'),
+        'id':dict(selector='article',read='attribute',attribute='id',step_id='S1')}
+    collect_measurements(driver,'https://authorized.test/',queries,batch=True)
+    assert calls == ['text','text','text','class','id']
+    collect_measurements(driver,'https://authorized.test/',{'again':queries['text1']},batch=True)
+    assert calls[-1] == 'text' and calls.count('text') == 4
+
+
+def test_duplicate_text_lists_do_not_share_mutable_evidence_values():
+    driver = SimpleNamespace(find_elements=lambda *a:[SimpleNamespace(text='item')],
+        execute_script=lambda source,*a: [dict(text='item',status='observed',text_complete=True)]
+            if source == rendered_text_script() else [dict(visible=True,sensitive=False)])
+    queries = {k:dict(selector='li',read='texts',step_id='S1') for k in ('O1','O2')}
+    result = collect_measurements(driver,'https://authorized.test/',queries,batch=True)
+    result['O1']['value'].append('changed')
+    assert result['O2']['value'] == ['item']
 
 
 def test_batch_missing_scalar_and_sensitive_targets_keep_existing_semantics():
@@ -210,8 +279,9 @@ def test_pipeline_does_not_regenerate_successful_code_after_observation_error(tm
         def complete_json(self,system,user):
             if system.startswith('You are Agent1'):
                 return dict(steps=[dict(id='S1',goal='Read state')],oracles=[dict(id='O1',
-                    step_id='S1',kind='gte',expected=1,meaning='at least one')])
-            if system.startswith('You are Agent2'): return dict(approved=True,issues=[])
+                    step_id='S1',kind='gte',expected=1,meaning='at least one',
+                    source_type='user_requirement',source_quote='at least one item')])
+            if system.startswith('You are Agent2'): return dict(approved=True,input_status='consistent',issues=[])
             generated.append(1)
             return dict(code='driver.title',bindings={'O1':dict(selector='.item',read='count',step_id='S1')})
     failure=dict(status='ERROR',error_type='RuntimeError',failed_phase='post_observe',
@@ -224,7 +294,7 @@ def test_pipeline_does_not_regenerate_successful_code_after_observation_error(tm
         def close_session(self): return dict(process_tree_terminated=True,profile_removed=True)
     monkeypatch.setattr(runtime,'ARTIFACT_ROOT',tmp_path)
     monkeypatch.setattr(runtime,'create_session',lambda *a,purpose,**kw:Session(purpose))
-    result=run_pipeline(target='dynamic',mode='llm',start_url='https://authorized.test/',requirement='Read state',
+    result=run_pipeline(target='dynamic',mode='llm',start_url='https://authorized.test/',requirement='Read state and verify at least one item',
         allow_local_research=True,allow_live_site=True,output_root=tmp_path,llm=Model())
     assert result['verdict']['status']=='ERROR' and len(generated)==1
     assert result['verdict']['failed_phase']=='post_observe' and result['verdict']['script_status']=='COMPLETE'

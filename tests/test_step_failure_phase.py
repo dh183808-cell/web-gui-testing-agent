@@ -38,6 +38,10 @@ class Node:
 
 class Driver:
     title = 'Synthetic phase fixture'
+    current_window_handle, window_handles = 'source', ['source']
+    def execute_script(self, script, *args):
+        assert 'getAttribute(\'target\')' in script
+        return dict(href='', target='')
     def __init__(self, page='form', allow_bad_wait=False):
         self.page, self.value, self.current_url = page, '', BASE + page
         self.allow_bad_wait = allow_bad_wait
@@ -199,8 +203,9 @@ def run_pipeline_regression(tmp_path,monkeypatch,*,cold_failure=False,reject_pat
             if system.startswith('You are Agent1'):
                 return dict(steps=[dict(id='S1',goal='Open form and enter synthetic input'),
                     dict(id='S2',goal='Submit and wait for result')],oracles=[dict(id='O1',step_id='S2',
-                    kind='gte',expected=1,meaning='at least one result')])
-            if system.startswith('You are Agent2'): return dict(approved=True,issues=[])
+                    kind='gte',expected=1,meaning='at least one result',
+                    source_type='user_requirement',source_quote='at least one result')])
+            if system.startswith('You are Agent2'): return dict(approved=True,input_status='consistent',issues=[])
             sid=data['current_step']['id'];self.generated.append(sid)
             if sid=='S1': return dict(code=S1,bindings={})
             if not data['execution_context']: return dict(code=CODE,bindings=QUERY)
@@ -286,9 +291,11 @@ def test_real_chrome_navigation_and_spa_wait_repairs(monkeypatch):
                 return dict(steps=[dict(id='S1',goal='Open the form'),
                     dict(id='S2',goal='Enter phase-check, load the dynamic button and continue'),
                     dict(id='S3',goal='Read the resulting state')],oracles=[
-                    dict(id='O1',step_id='S3',meaning='continued state',kind='equals',expected='Continued'),
-                    dict(id='O2',step_id='S3',meaning='one visible continue button',kind='gte',expected=1)])
-            if system.startswith('You are Agent2'): return dict(approved=True,issues=[])
+                    dict(id='O1',step_id='S3',meaning='continued state',kind='equals',expected='Continued',
+                         source_type='user_requirement',source_quote='Continued'),
+                    dict(id='O2',step_id='S3',meaning='one visible continue button',kind='gte',expected=1,
+                         source_type='user_requirement',source_quote='a visible button')])
+            if system.startswith('You are Agent2'): return dict(approved=True,input_status='consistent',issues=[])
             sid=data['current_step']['id']
             if data['execution_context']:
                 context=data['execution_context']

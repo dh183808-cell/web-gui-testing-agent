@@ -83,6 +83,11 @@ class RuntimePhaseTimeout(TimeoutError):
             self.partial['script_status'] = 'TIMEOUT'
         elif phase == 'oracle_capture':
             self.partial['oracle_status'] = 'TIMEOUT'
+            log = partial.get('oracle_log', [])
+            if log and log[-1].get('event') == 'started':
+                active = dict(log[-1],event='timeout',
+                    elapsed_seconds=round(max(0,elapsed-log[-1].get('started_seconds',0)),4))
+                self.partial.update(oracle_timeout=active,oracle_log=[*log,active])
 
 
 class LocalRuntimeUnavailable(RuntimeError):
@@ -294,6 +299,13 @@ class LocalSession:
                 name = result['_runtime_phase']
                 if name not in phase_limits:
                     raise LocalRuntimeUnavailable('Unknown Worker phase')
+                if result['event'] == 'progress':
+                    if name != phase or name != 'oracle_capture':
+                        raise LocalRuntimeUnavailable('Oracle progress outside capture phase')
+                    delta = result['partial']
+                    partial.setdefault('oracle_log',[]).append(delta['oracle_progress'])
+                    partial.setdefault('measurements',{}).update(delta.get('measurements',{}))
+                    continue
                 if result['event'] == 'started':
                     if name in seen or CHECKED_PHASES.index(name) < CHECKED_PHASES.index(phase):
                         raise LocalRuntimeUnavailable('Invalid Worker phase order')

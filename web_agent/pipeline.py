@@ -57,13 +57,20 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
                  enable_live_probes: bool = False, enable_live_recovery: bool = False,
                  demo_evidence_gap: bool = False, demo_broken_locator: bool = False,
                  start_url: str | None = None, allow_local_research: bool = False,
-                 step_attempts: int = 3, task_repairs: int = 5) -> dict:
+                 step_attempts: int = 3, task_repairs: int = 5,
+                 test_basis: str | None = None) -> dict:
+    if test_basis is not None and not isinstance(test_basis, str):
+        raise ValueError('test_basis must be plain text')
+    test_basis = test_basis or ''
+    if test_basis.strip() and target != 'dynamic':
+        raise ValueError('测试依据目前用于 --target dynamic；原有固定 arXiv/Fixture 入口保持原行为')
     if target == 'dynamic':
         if not allow_live_site or not allow_local_research or mode != 'llm':
             raise ValueError('Dynamic demo requires --mode llm --allow-live-site --allow-local-research')
         return _run_dynamic(requirement=requirement, url=start_url, headless=headless,
                             output_root=output_root, llm=llm, provider=provider, model=model,
-                            step_attempts=step_attempts, task_repairs=task_repairs)
+                            step_attempts=step_attempts, task_repairs=task_repairs,
+                            test_basis=test_basis, only_generate=only_generate)
     if target == 'arxiv' and not allow_live_site:
         raise ValueError('真实 arXiv 运行需要确认网站许可与访问规则：--allow-live-site')
     if target not in {'arxiv', 'fixture', 'fixture-bug'}:
@@ -225,7 +232,7 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
 
 
 def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, model,
-                 step_attempts, task_repairs):
+                 step_attempts, task_repairs, test_basis='', only_generate=False):
     """Dynamic branch in the existing Pipeline; six Agents retain their roles."""
     import hashlib
     import time
@@ -254,6 +261,8 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
     def write(name, value):
         _write_json(run_dir / name, value)
 
+    write('test_inputs.json',dict(requirement=requirement,test_basis=test_basis))
+
     def event(agent, action, **data):
         events.append(dict(agent=agent, action=action, elapsed_seconds=round(time.monotonic()-started,3), **data))
         write('events.json', events)
@@ -276,8 +285,10 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         return cleanup
 
     def observe(s, saved_ref=None):
+        import re
+        focus = re.findall(r'["“「]([^"”」]{2,80})["”」]', requirement)
         view = (json.loads((s.run_dir / saved_ref).read_text(encoding='utf-8')) if saved_ref
-                else dict(s.observe(max_elements=80, max_html=16000)))
+                else dict(s.observe(max_elements=80, max_html=16000, focus_terms=focus)))
         ref = view.get('html_ref')
         if ref:
             view['html_summary'] = (s.run_dir / ref).read_text(encoding='utf-8')[:16000]
@@ -294,6 +305,23 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         write('final_verdict.json', verdict)
         return dict(verdict=verdict, run_dir=str(run_dir), report=str(run_dir/'report.md'))
 
+    def input_inconclusive(*, planning_only=False):
+        decision = reviews[-1] if reviews else {}
+        input_status = decision.get('input_status','unclear')
+        verdict = dict(status='INCONCLUSIVE',checks=[],stopped_stage='Agent2',
+            reason_type='planning_only' if planning_only else
+                        'contract_unapproved' if input_status == 'consistent' else input_status,
+            message='测试契约已冻结；仅规划，尚未执行或采集正式证据' if planning_only
+                    else '测试依据/验收条件尚不能形成获准的判定契约；'
+                         + ('已停止后续执行，此前 Trial 不构成功能结论' if sessions else '未开始浏览器执行'),
+            execution_started=bool(sessions),issues=decision.get('issues',[]),
+            validation_scope=contract.get('validation_scope','undetermined'))
+        write('final_verdict.json',verdict)
+        event('Agent2','planning_only' if planning_only else 'input_not_ready',
+              input_status=decision.get('input_status'),issues=verdict['issues'])
+        return dict(verdict=verdict,run_dir=str(run_dir),report=str(run_dir/'report.md'),
+                    planning_only=planning_only)
+
     def plan(feedback=None):
         """One planning revision across initial review AND later semantic feedback."""
         nonlocal stage
@@ -301,17 +329,39 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         while True:
             stage = 'Agent1'
             revision = review_revisions['planning'] + 1
-            draft = Agent1TestDesigner().design_dynamic(requirement, url=url, llm=llm, feedback=feedback)
+            proposal_path = run_dir/('agent1_draft_'+str(revision)+'.json')
+            try:
+                draft = Agent1TestDesigner().design_dynamic(requirement, url=url, llm=llm, feedback=feedback,
+                                                            test_basis=test_basis,proposal_path=proposal_path)
+            except ValueError:
+                validation_path = proposal_path.with_suffix('.validation.json')
+                if not validation_path.exists():
+                    raise  # SDK/API errors are not semantic revision requests.
+                failure = json.loads(validation_path.read_text(encoding='utf-8'))
+                reviews.append(dict(approved=False,input_status='consistent',issues=failure['issues']))
+                write('agent2_reviews.json',reviews)
+                event('Agent1','invalid_plan',issues=failure['issues'])
+                if review_revisions['planning'] >= 1:
+                    return {}
+                review_revisions['planning'] += 1
+                feedback = [dict(issues=failure['issues'],
+                                 previous_draft=json.loads(proposal_path.read_text(encoding='utf-8')))]
+                continue
             write('agent1_draft_' + str(revision) + '.json', draft)
             event('Agent1','semantic_plan_created', steps=len(draft['steps']))
             stage = 'Agent2'
             decision = Agent2TestReviewer().review_dynamic(draft, llm=llm)
             reviews.append(decision)
             write('agent2_reviews.json',reviews)
+            write('input_review.json',dict(decision,revision=revision))
             if decision['approved'] and not draft.get('missing_inputs'):
                 approved = dict(draft, revision=revision, requirement_id=requirement_id)
                 validate_dynamic_plan(approved)
                 return approved
+            # Real contradictions/unknown expectations need clarification, not a
+            # model rewrite of user intent or a Selenium repair.
+            if decision['input_status'] in {'conflict','unclear'}:
+                return {}
             if review_revisions['planning'] >= 1:
                 return {}
             review_revisions['planning'] += 1
@@ -332,14 +382,17 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         calls_start = len(getattr(llm,'calls',[]))
         contract = plan()
         if not contract:
-            return fail('Agent2', {'error_type':'ReviewRejected','issues':reviews[-1].get('issues',[])})
+            return input_inconclusive()
         contract_hash = freeze_contract(contract)
+        if only_generate:
+            return input_inconclusive(planning_only=True)
         stage = 'Agent3'
         generator = Agent3SeleniumGenerator()
         trial = session('trial','incremental_development')
         observation = observe(trial)
         implementation, bindings, debug = [], {}, []
         checkpoints, step_entries = {}, {}
+        blockage = None
         cold_error = None
         review_feedback = {}
         while True:
@@ -418,6 +471,41 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                         failure_observation_ref=(failure_observation or {}).get('observation_ref')))
                     write('agent3_debug.json',debug)
                     if result['status']=='COMPLETE':
+                        unresolved = [o for o in contract['oracles'] if o['step_id']==step['id']
+                            and o.get('target') and result.get('measurements',{}).get(o['id'],{}).get('value') is not True]
+                        if unresolved:
+                            # Absence is a proposed business blockage, never a
+                            # renamed locator exception. Keep the successful prefix.
+                            oracle = unresolved[0]
+                            dependent = {step['id']}
+                            suffix = contract['steps'][index+1:]
+                            skipped = []
+                            for remaining in suffix:
+                                if dependent.intersection(remaining.get('depends_on', [])):
+                                    dependent.add(remaining['id'])
+                                    skipped.append(dict(step_id=remaining['id'],status='NOT_EXECUTED',
+                                        blocked_by=oracle['id'],reason='Required target not confirmed; dependent operation withheld'))
+                            if len(skipped) != len(suffix):
+                                result = dict(status='REJECTED',error_type='UnspecifiedDependency',
+                                    error='Cannot stop independent remaining steps; required-target dependencies must be reviewed by Agent1/2')
+                            else:
+                                candidate = dict(oracle_id=oracle['id'],step_id=step['id'],
+                                    measurement=result['measurements'][oracle['id']],
+                                    observation_ref=result.get('observation_ref'),skipped_steps=skipped,
+                                    source=source)
+                                stage = 'Agent2Blockage'
+                                decision = Agent2TestReviewer().review_blockage(contract,candidate,
+                                    implementation+[dict(id=step['id'],source=source)],llm=llm,
+                                    bindings=dict(bindings,**proposal['bindings']),checkpoints=checkpoints)
+                                write('blockage_review_'+uuid.uuid4().hex[:6]+'.json',dict(candidate=candidate,review=decision))
+                                event('Agent2','blockage_reviewed',approved=decision['approved'],oracle_id=oracle['id'])
+                                stage = 'Agent3'
+                                if decision['approved']:
+                                    blockage = dict(candidate,review=decision)
+                                else:
+                                    result = dict(status='REJECTED',error_type='BlockageReviewRejected',
+                                        error='Agent2 rejected missing-target claim; inspect context/target',issues=decision['issues'])
+                    if result['status']=='COMPLETE':
                         implementation.append(dict(id=step['id'],source=source))
                         bindings.update(proposal['bindings'])
                         observation = observe(trial)
@@ -448,11 +536,15 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                           repair_scope=(repair_context or {}).get('scope','whole_step'),
                           current_matches_entry=(result.get('execution') or {}).get('state_changed') is False,
                           restore_entry_required=restore_entry)
+                if blockage:
+                    break
             path, digest = generator.freeze_dynamic(implementation,run_dir=run_dir)
             stage = 'Agent2Implementation'
-            review = Agent2TestReviewer().review_implementation(contract,implementation,bindings,
+            review = (dict(approved=True,issues=[],reason='Prefix and negative-evidence plan reviewed by Agent2',
+                           blockage_review=blockage['review']) if blockage else
+                      Agent2TestReviewer().review_implementation(contract,implementation,bindings,
                                                                 observation=observation,llm=llm,
-                                                                checkpoints=checkpoints)
+                                                                checkpoints=checkpoints))
             write('implementation_review_'+uuid.uuid4().hex[:6]+'.json',review)
             if not review['approved']:
                 category = review['issue_type']
@@ -500,7 +592,7 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                     contract = plan([dict(issues=review['issues'],previous_contract=contract,
                                           untrusted_page=observation)])
                     if not contract:
-                        return fail('Agent2',failure)
+                        return input_inconclusive()
                     contract_hash = freeze_contract(contract)
                     implementation, bindings, review_feedback, checkpoints, step_entries = [], {}, {}, {}, {}
                     trial = session('trial','semantic_revision')
@@ -530,7 +622,7 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
             close(trial,'mandatory_cold_trial')
             cold = session('trial','mandatory_cold_trial')
             source = path.read_text(encoding='utf-8')
-            replay = cold.execute_program(source,step_ids=[s['id'] for s in contract['steps']],bindings=bindings)
+            replay = cold.execute_program(source,step_ids=[s['id'] for s in implementation],bindings=bindings)
             write('agent3_cold_trial_'+uuid.uuid4().hex[:6]+'.json',replay)
             event('Agent3','cold_trial_finished',status=replay['execution_status'],script_sha256=digest)
             if replay['execution_status']=='COMPLETE':
@@ -553,12 +645,16 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
             implementation = implementation[:failed_index]
             bindings = {key:v for key,v in bindings.items() if v['step_id'] in [s['id'] for s in implementation]}
             trial, cold_error = cold, failed
+            blockage = None
             observation = observe(trial)
             event('Agent3','cold_trial_repair',step_id=contract['steps'][failed_index]['id'],
                   repairs=repairs,error_type=failed.get('error_type'))
         delivery = dict(script_path=str(path),script_sha256=digest,contract_sha256=contract_hash,
-                        cold_trial_complete=True,step_ids=[s['id'] for s in contract['steps']],
+                        cold_trial_complete=True,step_ids=[s['id'] for s in implementation],
                         bindings=bindings,repairs_used=repairs,attempts=attempts,review_revisions=review_revisions)
+        if blockage:
+            delivery.update(execution_scope='reviewed_prefix_and_target_probe',blockage=blockage,
+                            skipped_steps=blockage['skipped_steps'])
         write('agent3_delivery.json',delivery)
         stage = 'Agent4'
         formal = session('formal','independent_formal_replay')
@@ -572,6 +668,9 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
               browser_session_id=evidence['browser_session_id'])
         stage='Agent5'
         verdict = Agent5EvidenceVerifier().verify_dynamic(contract,evidence).to_dict()
+        verdict['validation_scope'] = contract.get('validation_scope','undetermined')
+        if blockage:
+            verdict.update(execution_scope=evidence['execution_scope'],skipped_steps=evidence['skipped_steps'])
         write('final_verdict.json',verdict)
         event('Agent5','business_verdict',status=verdict['status'])
         return dict(verdict=verdict,run_dir=str(run_dir),report=str(run_dir/'report.md'))
@@ -596,6 +695,15 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         (run_dir/'report.md').write_text(
             '# Dynamic Web GUI demo\n\nStatus: '+final['status']+'\n\n'
             + 'Requirement: '+requirement+'\n\n'
-            + 'See test_contract.json, generated_test.py, agent3_debug.json, formal_evidence.json, '
+            + 'Test basis: '+(test_basis if test_basis.strip() else '未提供')+'\n\n'
+            + 'Validation scope: '+contract.get('validation_scope','undetermined')+'\n\n'
+            + ('未提供测试依据；结论仅针对用户明确验收条件，不代表说明书符合性。\n\n'
+               if not test_basis.strip() else '仅判断冻结 Oracle 覆盖的条款和验收条件，不代表整份说明书符合性。\n\n')
+            + '结论说明：'+final.get('message','')+'\n\n'
+            + ''.join('- '+s['step_id']+' 未执行：'+s['reason']+'；前置 Oracle '+s['blocked_by']+'\n'
+                      for s in final.get('skipped_steps',[]))+'\n'
+            + ''.join('- '+str(issue)+'\n' for issue in final.get('issues',[]))+'\n'
+            + 'See test_inputs.json, input_review.json, agent2_reviews.json, '
+            + 'test_contract.json, generated_test.py, agent3_debug.json, formal_evidence.json, '
             + 'final_verdict.json and cleanup.json.\n\n'
             + 'Local capability-limited execution; not an OS sandbox.\n',encoding='utf-8')

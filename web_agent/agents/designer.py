@@ -11,45 +11,67 @@ import json
 import re
 from typing import Any
 
-from ..schema import JSONModel, QuerySpec, ORACLE_GUIDE
+from ..schema import JSONModel, QuerySpec, ORACLE_GUIDE, ORACLE_SOURCE_GUIDE, TARGET_GUIDE, attach_oracle_sources
 
 
 class Agent1TestDesigner:
     """Use a model to interpret an arXiv SEARCH intent into a bounded query spec."""
 
-    def design_dynamic(self, requirement, *, url, llm, feedback=None):
+    def design_dynamic(self, requirement, *, url, llm, feedback=None, test_basis='', proposal_path=None):
         system = '''You are Agent1, a Web GUI test designer. Turn the original requirement into
-semantic ordered actions and explicit test expectations. No Selenium, selectors or HTML.
+semantic ordered actions and explicit test expectations using both inputs. No Selenium, selectors or HTML.
 Do not include read/by/selector/attribute execution hints in semantic Oracles.
 Return JSON {"steps":[{"id":"S1","goal":"..."}],
 "oracles":[{"id":"O1","step_id":"S4","meaning":"...","kind":"gte",
-"expected":1,"source_quote":"exact excerpt of original requirement"}],
+"expected":1,"source_type":"user_requirement","source_quote":"exact excerpt from selected source"}],
 "preconditions":["..."],"missing_inputs":[]}.
 Use 1..12 actions with sequential IDs. The browser ALREADY starts at the supplied URL;
-do not add an initial navigation action. Split interactions into individual steps,
+do not add an initial navigation action. If no supported expectation can be designed,
+return oracles=[] and explain missing_inputs; do not invent an Oracle to fill the list.
+Split interactions into individual steps,
 especially clicks causing navigation/dynamic updates. Expected values MUST reflect user
-data; never invent business success. For only unfinished items, expected list must contain
+data or applicable test_basis rules; never invent business success. For only unfinished items, expected list must contain
 only the unfinished item, and also check completed item remains completed before filtering.
-Do NOT assume webpage defaults or literal headings/messages before observing DOM.
-When a user specifies a choice, plan to ACTIVELY SELECT it, even if they say "keep"
+Do NOT assume webpage defaults or literal headings/messages without an explicit source.
+When a user specifies a choice TO APPLY, plan to ACTIVELY SELECT it, even if they say "keep"
 that value; its default is unknown. An unspecified default must remain unspecified.
+When specifically testing the INITIAL/DEFAULT state, observe it BEFORE any mutation;
+do not select the expected value first to manufacture default-state compliance.
+The expected default can come from test_basis or an explicit user acceptance condition.
 Do not add mandatory exact text/heading expectations unless that text comes from the
-original requirement. Page-load waits are technical implementation, not invented business
-Oracles. Every Oracle must cite source_quote from the user and test a requested fact;
+selected source. Page-load waits are technical implementation, not invented business
+Oracles. Every Oracle must cite source_quote and test a requested fact;
 derived numeric thresholds such as "at least one" => gte 1 are allowed.
 Oracles are DOM-readable facts and are attached to the step where they can be observed.
+If a source specifies literal feedback/message text, preserve that STRING as expected
+with equals/contains; do not reduce "displays <specified message>" to expected=true.
+Checking a feedback element exists cannot verify its specified contents. Keep the
+source's stated value even if prior website knowledge suggests a different response.
 No URLs outside the authorized origin, logins, downloads or destructive remote effects.'''
-        system += '\n' + ORACLE_GUIDE
+        system += '\n' + ORACLE_GUIDE + '\n' + ORACLE_SOURCE_GUIDE + '\n' + TARGET_GUIDE
         data = llm.complete_json(system, json.dumps(dict(requirement=requirement, start_url=url,
+                                                         test_basis=test_basis,
                                                          review_feedback=feedback or []), ensure_ascii=False))
         from ..schema import validate_dynamic_plan
-        data = dict(data, requirement=requirement)
+        data = dict(data, requirement=requirement, test_basis=test_basis, provenance_version=1)
         # Execution hints are not frozen semantic expectations. Agent3 chooses them
         # after DOM observation, using the actual Runtime capability contract.
         for oracle in data.get('oracles', []):
             for key in ('read', 'by', 'selector', 'attribute'):
                 oracle.pop(key, None)
-        validate_dynamic_plan(data)
+        attach_oracle_sources(data)
+        if proposal_path:
+            # Preserve a rejected semantic draft before schema validation. Never
+            # log API requests/headers/environment or SDK exception bodies.
+            proposal_path.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+        # Missing/incorrect citations are review feedback, not Selenium errors.
+        try:
+            validate_dynamic_plan(data, allow_incomplete=True, check_sources=False)
+        except ValueError as exc:
+            if proposal_path:
+                proposal_path.with_suffix('.validation.json').write_text(
+                    json.dumps(dict(issues=[str(exc)]),ensure_ascii=False,indent=2),encoding='utf-8')
+            raise
         return dict(data, requirement=requirement, start_url=url, interpretation_mode='real_llm')
 
     def design(self, requirement: str, mode: str = "template", *, llm: JSONModel | None = None,

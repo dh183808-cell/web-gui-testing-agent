@@ -28,14 +28,38 @@ class Agent5EvidenceVerifier:
             measurement = evidence.get('measurements', {}).get(oracle['id'], {})
             actual = measurement.get('value')
             expected = oracle['expected']
+            skipped = next((s for s in evidence.get('skipped_steps',[])
+                            if s['step_id']==oracle.get('step_id')),None)
             if measurement.get('read'):
                 try:
                     validate_oracle_binding(oracle, measurement)
                 except ValueError as exc:
                     return Verdict(status='ERROR',message='Formal evidence binding type error: '+str(exc))
             if (actual is None or measurement.get('status', 'observed') != 'observed'
+                    or measurement.get('text_complete') is False or measurement.get('truncated') is True
                     or not measurement.get('observation_ref') or not measurement.get('screenshot_ref')
                     or measurement.get('step_id', oracle.get('step_id')) != oracle.get('step_id')):
+                passed = None
+            elif oracle.get('target') and actual is False:
+                # A zero locator match, partial inventory or a Trial observation
+                # never establishes absence. Require independent Formal evidence.
+                probe = measurement.get('probe',{})
+                samples = probe.get('samples',[])
+                reliable = (evidence.get('purpose')=='formal'
+                    and evidence.get('blockage',{}).get('review',{}).get('approved') is True
+                    and measurement.get('absence_confirmed') is True
+                    and measurement.get('inventory_complete') is True
+                    and probe.get('context_stable') is True and not probe.get('reasons')
+                    and probe.get('url') == evidence.get('blockage',{}).get('measurement',{}).get('probe',{}).get('url')
+                    and probe.get('title') == evidence.get('blockage',{}).get('measurement',{}).get('probe',{}).get('title')
+                    and len(samples)>=3 and all(s.get('ready_state')=='complete' and s.get('found')==0 for s in samples)
+                    and probe.get('elapsed_seconds',0)>=probe.get('wait_seconds',2)>0)
+                passed = False if reliable else None
+            elif (evidence.get('execution_scope') == 'reviewed_prefix_and_target_probe'
+                    and actual is False and expected is True
+                    and measurement.get('read') in {'exists','visible_exists','visible'}):
+                # A redundant model locator may also miss the claimed control.
+                # It cannot independently convert an incomplete inventory to FAIL.
                 passed = None
             elif oracle['kind'] == 'equals':
                 passed = type(actual) is type(expected) and actual == expected
@@ -49,11 +73,21 @@ class Agent5EvidenceVerifier:
             checks.append(dict(oracle_id=oracle['id'], meaning=oracle['meaning'], expected=expected,
                                actual=actual, passed=passed, observation_ref=measurement.get('observation_ref'),
                                screenshot_ref=measurement.get('screenshot_ref'),
-                               binding={k: measurement[k] for k in ('by','selector','read','step_id','attribute') if k in measurement},
-                               evidence_status=measurement.get('status', 'observed')))
+                               **{k:oracle[k] for k in ('source_type','source_quote','source_span') if k in oracle},
+                               binding={k: measurement[k] for k in ('by','selector','read','step_id','attribute','target') if k in measurement},
+                               evidence_status='not_executed' if skipped else measurement.get('status',
+                                   'observed' if measurement else 'missing'),
+                               **({'not_executed_reason':skipped['reason'],
+                                   'blocked_by':skipped['blocked_by']} if skipped else {})))
         state = ('FAIL' if any(c['passed'] is False for c in checks) else
                  'INCONCLUSIVE' if not checks or any(c['passed'] is None for c in checks) else 'PASS')
-        return Verdict(status=state, message='Formal DOM evidence compared with frozen expectations', checks=checks)
+        if evidence.get('execution_scope') == 'reviewed_prefix_and_target_probe':
+            # Even if the target appears in Formal, missing dependent actions
+            # cannot become a PASS. Preserve that changed state as INCONCLUSIVE.
+            if state == 'PASS':
+                state = 'INCONCLUSIVE'
+        verdict = Verdict(status=state, message='Formal DOM evidence compared with frozen expectations', checks=checks)
+        return verdict
 
     @staticmethod
     def _norm(text: str) -> str:

@@ -69,7 +69,8 @@ def test_semantic_plans_do_not_freeze_unsupported_execution_hints():
     class Model:
         def complete_json(self,system,user):
             return dict(steps=[dict(id='S1',goal='Choose All fields')],oracles=[dict(
-                id='O1',step_id='S1',kind='equals',expected='All fields',meaning='label',read='selected_value')])
+                id='O1',step_id='S1',kind='equals',expected='All fields',meaning='label',read='selected_value',
+                source_type='user_requirement',source_quote='All fields')])
     contract = Agent1TestDesigner().design_dynamic('Choose All fields',url='https://authorized.test/',llm=Model())
     assert contract['oracles'][0]['expected'] == 'All fields' and 'read' not in contract['oracles'][0]
 
@@ -119,13 +120,14 @@ def test_binding_only_review_preserves_successful_suffix_and_browser(tmp_path,mo
             if system.startswith('You are Agent1'):
                 return dict(steps=[dict(id=f'S{i}',goal='Choose All fields' if i==1 else 'Continue')
                     for i in range(1,4)],oracles=[dict(id='O1',step_id='S1',kind='equals',
-                        expected='All fields',meaning='requested label')])
+                        expected='All fields',meaning='requested label',
+                        source_type='user_requirement',source_quote='All fields')])
             if system.startswith('You are Agent2 reviewing'):
                 self.audits+=1
                 return dict(approved=self.audits>1 and not repeat,issues=['O1 reads internal value, use selected_text'],
                     issue_type='implementation',repair_scope='bindings',step_ids=['S1'])
             if system.startswith('You are Agent2'):
-                return dict(approved=True,issues=[])
+                return dict(approved=True,input_status='consistent',issues=[])
             if system.startswith('You are Agent3 repairing'):
                 self.repairs+=1
                 assert len(created)==1 and len(executed)==3
@@ -201,7 +203,9 @@ def test_actual_actions_include_navigation_and_failure_without_input_values():
         def send_keys(self,*args): pass
         def click(self): driver.current_url='https://authorized.test/search/?query=quantum'
         def clear(self): raise RuntimeError('synthetic control failure')
-    driver=SimpleNamespace(current_url='https://authorized.test/',find_element=lambda *a:Node())
+    driver=SimpleNamespace(current_url='https://authorized.test/',find_element=lambda *a:Node(),
+        current_window_handle='source',window_handles=['source'],
+        execute_script=lambda *a:dict(href='',target=''))
     actions,events=[],[]
     with pytest.raises(RuntimeError):
         execute_source('x=driver.find_element(By.ID,"choice")\nx.send_keys("synthetic-input")\nx.click()\nx.clear()',

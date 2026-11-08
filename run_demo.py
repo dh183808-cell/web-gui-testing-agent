@@ -27,11 +27,14 @@ def main() -> int:
     parser.add_argument("--model", default=None,
                         help="override provider model (OpenRouter: provider/model slug)")
     parser.add_argument("--requirement", default=DEFAULT_REQUIREMENT)
+    parser.add_argument("--test-basis", default=None,
+                        help="Optional plain-text specification/manual for --target dynamic; separate from this test requirement")
     parser.add_argument("--show-browser", action="store_true", help="show Chrome window")
     parser.add_argument("--demo-delay", type=float, default=0.0, help="visual pause in seconds between major steps (0-3)")
     parser.add_argument("--allow-live-site", action="store_true",
                         help="you confirmed permission and acceptable low-frequency use of the target site")
-    parser.add_argument("--only-generate", action="store_true", help="do not start a Selenium test")
+    parser.add_argument("--only-generate", action="store_true",
+                        help="No Selenium execution; dynamic target only designs/reviews a sourced test contract")
     parser.add_argument('--max-probes', type=int, choices=[0, 1], default=1,
                         help='maximum active evidence re-observations (0 or 1)')
     parser.add_argument('--max-repairs', type=int, choices=[0, 1], default=1,
@@ -46,7 +49,7 @@ def main() -> int:
                         help='fixture only: inject an invalid keyword locator and test Agent6 recovery')
     args = parser.parse_args()
     try:
-        r = run_pipeline(requirement=args.requirement, target=args.target,
+        r = run_pipeline(requirement=args.requirement, test_basis=args.test_basis, target=args.target,
                          mode=args.mode, headless=not args.show_browser,
                          demo_delay=args.demo_delay, allow_live_site=args.allow_live_site, only_generate=args.only_generate,
                          provider=args.provider, model=args.model,
@@ -62,7 +65,7 @@ def main() -> int:
         return 2
     if args.target == 'dynamic':
         print(json.dumps(r, ensure_ascii=True, indent=2))
-        return 0 if r['verdict']['status']=='PASS' else 1
+        return 0 if r['verdict']['status']=='PASS' or r.get('planning_only') else 1
     print(json.dumps({"status": r["verdict"]["status"], "message": r["verdict"]["message"],
                       "report": r["report"], "run_dir": r["run_dir"],
                       "dom_source": r["inspector"]["inspector_source"],

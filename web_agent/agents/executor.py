@@ -29,7 +29,14 @@ class Agent4TestExecutor:
             raise ValueError('Frozen Agent3 source hash changed before formal execution')
         if not delivery.get('cold_trial_complete') or session.purpose != 'formal':
             raise ValueError('Formal execution requires a completed cold trial and independent formal session')
-        return session.execute_program(source, step_ids=delivery['step_ids'], bindings=delivery['bindings'])
+        if delivery.get('blockage'):
+            if delivery['blockage'].get('review',{}).get('approved') is not True:
+                raise ValueError('Partial execution requires an approved Agent2 blockage review')
+        evidence = session.execute_program(source, step_ids=delivery['step_ids'], bindings=delivery['bindings'])
+        if delivery.get('blockage'):
+            evidence.update(execution_scope=delivery['execution_scope'],blockage=delivery['blockage'],
+                            skipped_steps=delivery['skipped_steps'])
+        return evidence
 
     def __init__(self, *, root: Path | None = None,
                  runner: Callable[..., subprocess.CompletedProcess[str]] | None = None) -> None:
