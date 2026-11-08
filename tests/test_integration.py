@@ -6,6 +6,7 @@ from web_agent.fixture_server import local_fixture
 from web_agent.pipeline import run_pipeline
 from web_agent.report import html_report
 from web_agent.agents import Agent5EvidenceVerifier
+from web_agent.agents import executor as executor_module
 from .test_contract import sample_evidence, build
 
 
@@ -53,7 +54,7 @@ def test_six_stage_pipeline_with_mock_executor_pass(tmp_path, monkeypatch):
         p = Path(args[1]).with_name("evidence.json")
         p.write_text(json.dumps(sample_evidence(), ensure_ascii=False), encoding="utf-8")
         return SimpleNamespace(stdout="MOCK: no browser executed", stderr="", returncode=0)
-    monkeypatch.setattr(pipeline.subprocess, "run", mock_subprocess_run)
+    monkeypatch.setattr(executor_module.subprocess, "run", mock_subprocess_run)
     r = pipeline.run_pipeline(target="fixture", output_root=tmp_path)
     assert r["verdict"]["status"] == "PASS"
     assert [s["agent"] for s in r["stages"]] == [f"Agent{i}" for i in range(1, 7)]
@@ -73,7 +74,7 @@ def test_six_stage_pipeline_with_mock_executor_detects_defect(tmp_path, monkeypa
         Path(args[1]).with_name("evidence.json").write_text(
             json.dumps(sample_evidence(bad=True), ensure_ascii=False), encoding="utf-8")
         return SimpleNamespace(stdout="MOCK", stderr="", returncode=0)
-    monkeypatch.setattr(pipeline.subprocess, "run", mock_subprocess_run)
+    monkeypatch.setattr(executor_module.subprocess, "run", mock_subprocess_run)
     r = pipeline.run_pipeline(target="fixture-bug", output_root=tmp_path)
     assert r["verdict"]["status"] == "FAIL"
     assert Path(r["report"]).exists()

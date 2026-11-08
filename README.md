@@ -1,201 +1,130 @@
-# WebAgent v0.3 — Selenium Web GUI Testing Agent
+# WebAgent v0.5
 
-The v0.4 dynamic research demo now uses the existing six Agents with real DeepSeek
-and local Chrome. With `DEEPSEEK_API_KEY`, `CHROME_BINARY` and `CHROMEDRIVER_PATH`
-configured on the trusted control side, run:
+用六个逻辑 Agent 完成自然语言驱动的 Web GUI 功能测试。当前开发入口是
+`run_demo.py --target dynamic`：真实模型规划、实时 DOM 编码与有限调试、完整冷启动、
+独立 Chrome 正式重放和基于证据的判定。Selenium 保持为唯一浏览器自动化工具。
 
-```powershell
-.\.venv\Scripts\python.exe run_demo.py --target dynamic --mode llm --provider deepseek --url 'https://demo.playwright.dev/todomvc/' --allow-live-site --allow-local-research --requirement 'Add Read book and Write tests. Complete Read book, check it is completed, select Active and verify only Write tests remains.'
-```
+v0.3 的 Fixture/固定 arXiv 模板入口仍供旧 CLI、Streamlit 和回归测试使用。
+这些入口不等于 v0.5 Dynamic；`app_ui.py` 尚未接入 Dynamic，本轮没有开发新前端。
 
-动态入口现在区分可选的纯文本测试依据 --test-basis 与本次测试需求
---requirement。Agent2 在启动浏览器前审核冲突和 Oracle 来源；矛盾或预期不明确
-返回 INCONCLUSIVE，不会交给 Agent3 强行调试。省略测试依据的旧命令仍可用，
-其结论仅针对用户明确的验收条件，不代表说明书符合性。
+## 本地运行
 
-可以先用已有 --only-generate 只生成、审核并保存契约（仍调用所选模型，但不启动
-Chrome，也不产生业务 PASS）。以下是**人工构造的演示依据，并非 arXiv 官方规格**：
-
-~~~powershell
-$basis = '演示验收标准：搜索时应采用用户主动选择的字段。本次指定关键词应至少有一条可见结果。'
-$requirement = '选择 All fields，搜索 GUI Agent，检查搜索结果数量。'
-.\.venv\Scripts\python.exe run_demo.py --target dynamic --mode llm --provider deepseek --url 'https://arxiv.org/search/advanced' --allow-live-site --allow-local-research --test-basis $basis --requirement $requirement --only-generate
-~~~
-
-查看新运行目录中的 test_inputs.json、input_review.json、test_contract.json。
-每条 Oracle 记录 source_type（test_basis / user_requirement）、source_quote
-及可信控制侧计算的 source_span（从零开始的字符区间 [start,end) 和从一开始的
-line）。初始输入冲突时不会生成获准的 test_contract.json。删除
---only-generate 重新启动完整任务时，会重新规划、审核，再进入现有 Agent3～5 流程，
-不会自动恢复上一次仅规划的运行。当前新增测试依据仅用于
---target dynamic；旧固定模板入口保持原行为，不解析 Word/PDF。
-
-The model writes actual Selenium Python in a capability-limited subset; the local
-Worker does not receive API credentials. This is not an OS sandbox. See the local
-Chinese report `docs/v04_phase2_demo_acceptance.md` for actual evidence and limits:
-two successful runs, one technical failure, one interrupted run; three consecutive
-successes and changed-input acceptance were not completed before the user stopped testing.
-
-The v0.4 phase-1 infrastructure supports **local Windows Selenium + Chrome**;
-it is **not wired into the six-agent pipeline yet**. Docker and LLM credentials
-are unnecessary. Run the human-authored, reviewed Fixture programs from the repo root:
+项目使用本地 Windows Python、Selenium、Chrome 和 ChromeDriver，不依赖 Docker。
+安装项目依赖后，使用项目虚拟环境运行：
 
 ```powershell
-.\.venv\Scripts\python.exe run_infrastructure_check.py --driver-path 'C:\path\to\chromedriver.exe'
-```
-
-Use an installed ChromeDriver matching Chrome (or set `CHROMEDRIVER_PATH`);
-this entry does not automatically download drivers. Add `--show-browser` to watch.
-It creates `artifacts/phase1_local_*/acceptance.json`, per-session logs, bounded
-DOM observations and screenshots. Trial/Formal use separate Profiles and resettable
-Fixture data; Windows Job Objects enforce deadlines and clean up owned processes.
-**A local subprocess is not a security sandbox.** Arbitrary/model-generated Python
-is disabled; only registered programs with a pinned reviewed-source hash can run.
-File/network/CPU/memory permission isolation is not provided.
-See `docs/v04_phase1_infrastructure_acceptance.md` for the local Chinese acceptance
-report (the repository currently ignores `docs/`, so this file does not sync).
-The old demos below still use their original trusted template path; they do not
-accept arbitrary model Python. The new local acceptance covers infrastructure,
-not Agent3 autonomous development or a real-model end-to-end run.
-
-> **Six logical roles**, with a working evidence collection plan, targeted re-observation and bounded test-script recovery. Keeps DeepSeek / OpenRouter / OpenAI support from v0.2.2.
->
-> **Scope**: arXiv advanced-search → results → abstract detail. This is a *restricted engineering prototype*, not a universal 6-LLM-agent browser automation platform.
-
-## 1. Windows PowerShell: installation
-
-Unzip **WebAgent03.zip**. Its root folder is `WebAgent`. Keep your working v0.2.2 separately.
-
-```powershell
-cd .\WebAgent
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120 --retries 5
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-No PowerShell activation is necessary; always run the project's `.venv` Python to avoid accidentally invoking Anaconda's packages. Python 3.11/3.12 and Chrome are recommended. If the mirror is unavailable, remove the `-i ...` option.
-
-## 2. Three demonstrations (no API key needed)
-
-**Demo A — Normal full workflow (expected PASS)**
+在当前 PowerShell 配置已安装且与 Chrome 匹配的 Driver；路径是示例，需按本机修改：
 
 ```powershell
-.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template --show-browser --demo-delay 0.7
+$env:CHROMEDRIVER_PATH = 'C:\path\to\chromedriver.exe'
+$env:CHROME_BINARY = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+Test-Path $env:CHROMEDRIVER_PATH
 ```
 
-**Demo B — Agent5 active evidence acquisition (expected PASS after one probe)**
+Dynamic 的受控 Runtime 不自动下载 Driver，环境变量只对当前终端及其子进程有效。
+模型凭据通过控制侧环境变量或项目 `.env` 配置，例如 `DEEPSEEK_API_KEY`；
+不写入源码、生成的 Selenium 脚本或日志。复用 `llm_adapter.py`，也支持已有
+OpenRouter/OpenAI provider 选项；验收记录注明实际使用的 provider/model。
+
+下面的依据是人工构造的演示规格，不是 Selenium 官方说明。访问需获得授权；
+页面表单只填写测试数据，不输入密码或真实个人信息。
 
 ```powershell
-.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template --demo-evidence-gap --show-browser --demo-delay 0.7
+$basis = '在 Web form 页面填写 Text input 并点击 Submit 后，结果页面应显示 Received!。'
+$requirement = '在 Text input 输入 WebAgent Test，点击 Submit，验证提交后的页面反馈符合测试依据。'
+.\.venv\Scripts\python.exe run_demo.py --target dynamic --mode llm --provider deepseek --url 'https://www.selenium.dev/selenium/web/web-form.html' --allow-live-site --allow-local-research --test-basis $basis --requirement $requirement
 ```
 
-Local-only *controlled fault injection*: the recorded `detail.title` is deliberately omitted after the first browser execution; Agent5 identifies the missing oracle evidence and requests Agent4 to **open that same paper detail in a fresh Selenium browser session** and read only the missing field. Inspect `controlled_evidence_gap.json`, `probe_request.json`, `probe_result.json`, `collection_log` and `report.html`. This is an **evidence collection simulation**, not a discovered arXiv bug.
+默认无头 Chrome；添加 `--show-browser` 才显示窗口。`--test-basis` 是可选的纯文本测试依据，
+`--requirement` 是本次测试需求。两者独立保存，不解析 Word/PDF。只根据需求测试时，
+结论不代表说明书符合性。`--only-generate` 只规划、审核契约，仍调用模型，不启动浏览器。
 
-**Demo C — Agent6 bounded locator recovery (expected PASS after first ERROR and one repair)**
+## 六 Agent 与数据流
 
-```powershell
-.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template --demo-broken-locator --show-browser --demo-delay 0.7
+```mermaid
+flowchart LR
+    Input[测试依据 + 测试需求] --> A1[Agent1 设计步骤与预期]
+    A1 --> A2[Agent2 审核来源并冻结契约]
+    A2 --> A3[Agent3 DOM 编码和有限修复]
+    A3 --> Cold[冷启动试运行]
+    Cold --> A4[Agent4 独立 Formal 重放同版本]
+    A4 --> A5[Agent5 正式证据判定]
+    A3 -->|技术失败或预算耗尽| A6[Agent6 诊断]
+    A4 -->|技术异常| A6
 ```
 
-Another *controlled fault injection*: the initial Selenium script is generated with a broken keyword locator. Agent6 classifies the `locate_keyword` error, requests **one allowlisted locator-only regeneration** from Agent3, and Agent4 executes the new script. Inspect `repair_request.json`, `generated_test_attempt2.py`, `evidence_attempt2.json`, `recovery_history.json` and the report. The original test contract/oracles do not change.
+Pipeline 管阶段、权限、预算和终止；Agent 不自行调用其他 Agent。默认失败步骤最多
+3 次尝试、任务最多 5 次失败修复，保持已有时间预算。正确操作后的业务值不匹配不应
+触发“修到符合预期”。必要目标缺失可由 Agent2 审核候选阻塞，再冷启动并由 Agent4
+独立确认；依赖步骤标记为 `NOT_EXECUTED`，不能用 Trial 证据直接判 FAIL。
 
-**Demo D — Known faulty application (expected FAIL, no automatic repair)**
+| 结果 | 含义 |
+| --- | --- |
+| PASS | 必要正式证据符合冻结预期 |
+| FAIL | 可靠正式证据证明不符合冻结预期 |
+| ERROR | 代码、浏览器或 Runtime 等技术异常 |
+| INCONCLUSIVE | 输入/预期不明确或证据不足，不能可靠判定 |
+
+CLI 对 PASS 或仅规划正常返回 0；FAIL、ERROR、INCONCLUSIVE 的完整运行返回 1。
+非零退出码本身不能证明 Selenium 执行异常，应读取 `final_verdict.json`。
+
+## 模块职责
+
+| 模块 | 用途 |
+| --- | --- |
+| `web_agent/agents/` | 六角色，保留 Dynamic 方法和仍使用的旧模板方法 |
+| `pipeline.py`、`schema.py` | 单一编排入口；步骤、Oracle 来源、类型、依赖及交付契约 |
+| `selenium_runtime.py`、`local_worker.py` | 会话管理、独立 Profile/运行目录、分阶段超时、进程树清理；Worker 独占 WebDriver |
+| `checked_selenium.py`、`rendered_text.js` | 受限 Selenium 解释与统一取证，完整正文读取、去重、必要目标清点 |
+| `dom_inspector.py` | 观察已有 driver，批量 DOM 提取、压缩和脱敏；不创建浏览器 |
+| `llm_adapter.py` | 控制侧模型配置和 API 调用 |
+| `fixture_server.py` | 本地合成页面与可独立重置的服务端数据，供回归与基础设施验收 |
+| `evidence_plan.py`、`probe_plan.py`、`probe.py`、`probe_runner.py` | 旧模板的检查点取证和受限详情补证；非 Dynamic 业务路径 |
+| `report.py` | 旧模板 HTML 报告；Dynamic 当前保存 JSON 与 `report.md` |
+
+Agent3 的正式导入位置是 `web_agent.agents.generator`。已移除仅重导出的
+`web_agent.generator`；旧的 `Agent2.approve()` 使用 `build_contract()` 替代。
+一次性页面检查在 `selenium_runtime.inspect_page()`；实时观察仍为
+`dom_inspector.observe_session(driver)`。
+
+每次产物在独立 `artifacts/<run_id>/`。Dynamic 的主要文件：
+
+- `test_inputs.json`、`input_review.json`、`test_contract.json`：原始输入、审核、Oracle 引文与位置。
+- `agent3_debug.json`、`generated_test.py`、`agent3_delivery.json`：开发记录、冻结源码/哈希和冷启动交付。
+- `agent3_cold_trial_*.json`、`formal_evidence.json`、`trial/`、`formal/`：独立执行及 DOM/截图/测量引用。
+- `final_verdict.json`、`cleanup.json`、`llm_calls.json`、`report.md`：结论、清理、调用元数据及运行说明。
+
+## 保留的旧入口
+
+以下仍为固定搜索模板，用于离线/浏览器回归，不是自由 Dynamic 编码：
 
 ```powershell
-.\.venv\Scripts\python.exe run_demo.py --target fixture-bug --mode template --show-browser
-```
-
-The injected bug deliberately changes a search-list title but not its matching detail title. **FAIL is expected**; the CLI exit code is `1` because the test failed. The system must not rewrite a correct oracle to turn this into PASS.
-
-You may disable active mechanisms in the CLI using `--max-probes 0` and/or `--max-repairs 0`. v0.3 permits at most one targeted probe and one code repair per run. The fault-injection flags are accepted *only for local fixtures*.
-
-## 3. Streamlit demo
-
-```powershell
+.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template
+.\.venv\Scripts\python.exe run_demo.py --target fixture-bug --mode template
+.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template --demo-evidence-gap
+.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template --demo-broken-locator
+.\.venv\Scripts\python.exe run_infrastructure_check.py --driver-path $env:CHROMEDRIVER_PATH
 .\.venv\Scripts\python.exe -m streamlit run app_ui.py
 ```
 
-The UI exposes the target, template/LLM mode, local fault injection, probe/repair budgets, actual screenshots, generation audit, acquisition logs and recovery decisions. The screenshot tab is for viewing evidence, **not** a real-time desktop mirror. Use `--show-browser` or uncheck the headless option to show Selenium driving Chrome.
+`--target arxiv` 也是旧固定入口；任意任务应使用 Dynamic 并指定授权 URL。
+不因旧测试名包含 v0.2/v0.3 就删除仍有效的异常处理、取证和契约回归。
 
-## 4. Real DeepSeek / OpenRouter LLM
+## 边界与验收
 
-Use the **same `.env.example` and LLM adapter as v0.2.2**. DeepSeek and OpenRouter use OpenAI-compatible API endpoints, with their *own* provider credentials (not an OpenAI API key). Create a `.env` and never commit it or include it in screen recordings.
+本地子进程与受限解释器都不是操作系统沙箱，没有文件/网络/CPU/内存权限隔离。
+Worker 不继承模型凭据；禁止任意 Python、Shell、反射和系统文件读取。
+页面内容是不可信数据。复杂窗口选择、iframe/Shadow DOM 完整遍历、自定义控件的
+全面负面证明尚不支持；证据不足保持 INCONCLUSIVE，技术故障仍为 ERROR。
+浏览器 Profile 重置不等于远端服务端数据重置，有副作用操作需授权及可重放环境。
 
-```powershell
-Copy-Item .env.example .env
-notepad .env
-```
-
-For DeepSeek, fill in `LLM_PROVIDER=deepseek`, `DEEPSEEK_API_KEY=...`, `DEEPSEEK_MODEL=...`. Use a model ID supported by your account/provider. For OpenRouter, fill in `LLM_PROVIDER=openrouter`, `OPENROUTER_API_KEY=...`, `OPENROUTER_MODEL=provider/model` (replace it with an available model ID).
-
-```powershell
-.\.venv\Scripts\python.exe run_demo.py --target fixture --mode llm --provider deepseek --show-browser
-# or: --provider openrouter
-```
-
-LLM mode uses the actual model for Agent1's bounded query intent, Agent2's independent review and Agent3's locator ranking. Agent4 remains deterministic Selenium execution; Agent5 and Agent6 have **real decision logic**, but are *not* independent LLM instances. This design avoids running arbitrary generated Python from untrusted model output.
-
-## 5. What changed in v0.3?
-
-| Role | v0.3 execution | Main output |
-|---|---|---|
-| Agent1 | Parse bounded natural language search intent | `draft_cases.json` |
-| Agent2 | Review intent, freeze oracles, issue `Evidence Plan` (4 checkpoints for a full search/detail run) | `test_contract.json` |
-| Agent3 | Read current DOM using DOM Inspector, select allowlisted locators, render reviewable Selenium Python; regenerate limited locators on approved repair | `generated_test.py`, `generated_test_attempt2.py` if needed |
-| **Agent4** | Selenium GUI operations; execute evidence checkpoints, selectively take requested screenshots, preserve acquisition logs; execute independent detail re-observation | `evidence.json`, `collection_log`, `probe_result.json` |
-| **Agent5** | Check oracles; identify *missing* eligible evidence; issue a bounded `detail_reobserve` request, then re-evaluate | `probe_request.json`, revised verdict |
-| **Agent6** | Diagnose bounded locator errors (keyword/field/CS control); request one regenerating pass; route terminal results and keep history | `repair_request.json`, `recovery_history.json`, `final_verdict.json`, `report.html` |
-
-Agent4's collectors are **plan-driven for the supported search workflow**, not an arbitrary-evidence DSL; only allowlisted fields/checkpoints are available. Agent5's interactive verification is currently restricted to missing *paper detail title/ID* evidence. Agent6 can repair a subset of locator failures, not timeouts due to network, CAPTCHA or application failures.
-
-### v0.3 execution data flow
-
-```
-Requirements → Agent1 → Agent2: Test Contract + Evidence Plan
-                                    │
-                                    ▼
-                       Agent3: DOM Inspector + script
-                                    │
-                                    ▼
-                         Agent4: Selenium + evidence
-                                    │
-                                    ▼
-                         Agent5: oracle verification
-                           │                 │
-                 missing detail data    execution ERROR
-                           │                 │
-                   targeted probe     Agent6 repair decision
-                           │                 │
-                   Agent4 reobserve   Agent3 regenerate → Agent4 rerun
-                           └────────┬────────┘
-                                    ▼
-                           final HTML report
-```
-
-All original and repaired script/source files are retained. Each run has its own timestamped `artifacts/<run_id>/` folder, and `report.html` includes checkpoint observations, probes and repair history.
-
-## 6. Targeting real arXiv
-
-The baseline arXiv Selenium run has been demonstrated by the user on **v0.2.2**. **v0.3 has not been executed against arxiv.org in this build environment.** The site may change, require consent or block automated requests. `--target arxiv` therefore requires `--allow-live-site` and the operator's confirmation of acceptable usage.
-
-Example *only when you have permission*:
-
-```powershell
-.\.venv\Scripts\python.exe run_demo.py --target arxiv --allow-live-site --mode llm --provider deepseek --show-browser
-```
-
-By default, the real target **does not** automatically trigger additional probe or repair visits, even though local fixtures can. To explicitly permit one extra visit / test rerun under appropriate authorization, use `--enable-live-probes` and/or `--enable-live-recovery`. Do not circumvent access controls, login requirements or rate limits. This tool is for low-frequency, permitted testing, not scraping.
-
-## 7. Supported / unsupported
-
-- Supported: single arXiv-like advanced search; keyword, field, CS checkbox; optional open-first-result and cross-page ID/title checks; screenshot & DOM evidence; basic issue classification; bounded recovery for known locator errors.
-- Unsupported: arbitrary websites, login/payment, large-scale crawling, universal GUI repair, unconstrained LLM-produced code, validating publication facts or judging arbitrary UI visual defects.
-- `--only-generate` only creates a script; the verdict must be `INCONCLUSIVE`, never a fake PASS.
-
-## 8. Verification status
-
-- **45/45 offline tests passed** at packaging time: 34 baseline regressions plus 11 new evidence-plan/probe/recovery tests, including mocked subprocess integration.
-- **Actual Selenium+Chrome v0.3 end-to-end tests were not run here** because this sandbox lacks the Selenium package and external package network access. Please run the four commands in §2 on your Windows system before calling v0.3 fully validated.
-- Actual paid provider API calls were not made without credentials. Do not paste your API keys into chat.
-
-Read `VERIFICATION_STATUS.md` for the detailed scope and test limits.
+本轮架构清理的基线、模块依赖前后对比、删除理由、pytest 与三项真实模型/Chrome
+回归记录见 `docs/v05_architecture_cleanup_acceptance.md` 和
+`artifacts/v05_architecture_cleanup/`。Mock 测试不替代真实端到端验收。
+`AGENTS.md`、`docs/` 和运行产物当前被 `.gitignore` 忽略，不会自动同步到其他克隆；
+README 和源码中的说明可随仓库共享。

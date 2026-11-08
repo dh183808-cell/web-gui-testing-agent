@@ -70,12 +70,11 @@ def validate_business_waits(source, contract):
 
 
 class Agent3SeleniumGenerator:
-    """Render an approved contract and DOM snapshot into a script Path.
+    """Develop/repair Dynamic steps and freeze source; retain legacy templates.
 
-    Writes locator plan, generation audit and Python source in run_dir (which
-    must exist). llm mode may call the shared model for allowlisted ranking.
-    Invalid selections/repair requests raise ValueError; model/I/O errors
-    propagate. Never executes the script, edits oracles or schedules retries.
+    Browser execution and retry scheduling belong to Pipeline and Runtime.
+    Dynamic code and bindings cannot change frozen test semantics. generate()
+    below is the older bounded arXiv locator/template entry, not Dynamic generation.
     """
 
     def develop_step(self, contract, step, observation, *, llm, previous=None, error=None, proposal_path=None,

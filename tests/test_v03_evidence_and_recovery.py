@@ -12,8 +12,10 @@ import pytest
 
 from web_agent.agents import Agent1TestDesigner, Agent2TestReviewer, Agent5EvidenceVerifier, Agent6RecoveryController
 from web_agent.evidence_plan import collect_checkpoint
-from web_agent.probe import make_probe_request, merge_probe, _validate_request
-from web_agent.generator import Agent3SeleniumGenerator
+from web_agent.probe import merge_probe, _validate_request
+from web_agent.probe_plan import make_probe_request
+from web_agent.agents.generator import Agent3SeleniumGenerator
+from web_agent.agents import executor as executor_module
 from web_agent.fixture_server import search_form
 from web_agent.dom_inspector import compact_dom
 from .test_contract import build, sample_evidence
@@ -148,7 +150,7 @@ def test_pipeline_agent5_active_reobservation(tmp_path, monkeypatch):
             data['detail']['detail_url'] = 'http://127.0.0.1:8765/abs/2601.00001'
             Path(args[1]).with_name('evidence.json').write_text(json.dumps(data), encoding='utf-8')
         return SimpleNamespace(stdout='mocked', stderr='', returncode=0)
-    monkeypatch.setattr(pipe.subprocess, 'run', fake_run)
+    monkeypatch.setattr(executor_module.subprocess, 'run', fake_run)
     r = pipe.run_pipeline(target='fixture', demo_evidence_gap=True, output_root=tmp_path)
     assert r['verdict']['status'] == 'PASS'
     assert r['probe_count'] == 1
@@ -174,7 +176,7 @@ def test_pipeline_agent6_regenerates_after_locator_fault(tmp_path, monkeypatch):
             path = file.with_name('evidence_attempt2.json')
         path.write_text(json.dumps(data), encoding='utf-8')
         return SimpleNamespace(stdout='mock', stderr='', returncode=0)
-    monkeypatch.setattr(pipe.subprocess, 'run', fake_run)
+    monkeypatch.setattr(executor_module.subprocess, 'run', fake_run)
     r = pipe.run_pipeline(target='fixture', demo_broken_locator=True, output_root=tmp_path)
     assert r['verdict']['status'] == 'PASS'
     assert r['repair_count'] == 1
@@ -196,7 +198,7 @@ def test_pipeline_does_not_retry_a_confirmed_app_bug(tmp_path, monkeypatch):
         calls.append(args)
         Path(args[1]).with_name('evidence.json').write_text(json.dumps(sample_evidence(bad=True)), encoding='utf-8')
         return SimpleNamespace(stdout='mock', stderr='', returncode=0)
-    monkeypatch.setattr(pipe.subprocess, 'run', fake_run)
+    monkeypatch.setattr(executor_module.subprocess, 'run', fake_run)
     r = pipe.run_pipeline(target='fixture-bug', output_root=tmp_path)
     assert r['verdict']['status'] == 'FAIL'
     assert len(calls) == 1

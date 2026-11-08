@@ -1,10 +1,9 @@
-"""Agent4: isolated script/probe execution and evidence/log persistence.
+"""Agent4: independent Formal replay and raw evidence, never business verdicts.
 
-The generated script calls shared selenium_runtime.execute_test; the probe
-worker calls shared probe.execute_probe. This agent manages those processes,
-preserves attempt filenames and returns raw evidence, never functional verdicts.
-Timeouts/missing output become ERROR evidence; malformed JSON and I/O/OS errors
-propagate as before. Runner injection permits browser-free unit tests.
+Dynamic delivery is hash-checked and replayed by the shared managed Runtime.
+The retained legacy execute/probe methods run trusted templates and detail probes
+in subprocesses. A subprocess is not a security sandbox. Runner injection permits
+browser-free regression tests of that older entry.
 """
 from __future__ import annotations
 

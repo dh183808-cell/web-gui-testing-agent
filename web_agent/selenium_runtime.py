@@ -534,6 +534,21 @@ def make_driver(*, headless: bool = True, profile_dir: Path | None = None,
     return driver
 
 
+def inspect_page(url: str, *, headless: bool = True) -> dict:
+    """Legacy one-shot inspection; this layer owns driver creation and cleanup.
+
+    Dynamic sessions use the existing Worker and observe_session on its driver.
+    DOM tools do not import the Runtime or own browser lifetimes.
+    """
+    from .dom_inspector import observe_session
+    driver = make_driver(headless=headless)
+    try:
+        driver.get(url)
+        return observe_session(driver)
+    finally:
+        driver.quit()
+
+
 def _first_displayed(driver, css: list[str], *, timeout: int = 12):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait

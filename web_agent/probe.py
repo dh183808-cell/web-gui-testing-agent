@@ -14,9 +14,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any
 
-from .selenium_runtime import make_driver, normalize_id, _first_displayed
-
-from .probe_plan import RECOVERABLE_EVIDENCE, make_probe_request
+from .selenium_runtime import make_driver, _first_displayed
+from .evidence_plan import normalize_id
+from .probe_plan import RECOVERABLE_EVIDENCE
 
 
 def _validate_request(request: dict, base_url: str, *, allow_live: bool = False) -> None:

@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-from urllib.parse import parse_qs, urlparse, quote
+from urllib.parse import parse_qs, urlparse
 import json
 
 PAPERS = [

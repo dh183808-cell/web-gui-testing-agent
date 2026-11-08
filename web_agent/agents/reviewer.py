@@ -210,10 +210,6 @@ legacy semantic Oracles; actual bindings must use the shared supported capabilit
                     result['step_ids'].append(oracle['step_id'])
         return result
 
-    def approve(self, draft: dict[str, Any], *, target: str) -> TestContract:
-        # Kept for v0.1 backwards compatibility.
-        return self.build_contract(draft, target=target)
-
     def build_contract(self, draft: dict[str, Any], *, target: str) -> TestContract:
         query = draft["query"]
         spec = QuerySpec(**query)

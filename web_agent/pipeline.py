@@ -1,9 +1,8 @@
-"""Six-role WebAgent v0.3 pipeline.
+"""Six-role orchestration: v0.5 Dynamic plus retained v0.3 fixture/template entry.
 
-A1/A2 produce a frozen contract; A3 generates allowlisted Selenium code;
-A4 runs with the evidence plan; A5 evaluates and can request one targeted GUI
-re-observation; A6 can request one locator-only regeneration on an execution
-ERROR. No fault is reclassified as an application BUG due to a tool failure.
+Dynamic freezes sourced expectations, develops/replays checked Selenium, then
+collects independent Formal evidence. The legacy branch retains bounded search,
+detail probes and locator recovery for the existing CLI/UI and regression suite.
 """
 from __future__ import annotations
 
@@ -12,15 +11,13 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-import subprocess
 import uuid
 
-from .agents import (Agent1TestDesigner, Agent2TestReviewer,
+from .agents import (Agent1TestDesigner, Agent2TestReviewer, Agent3SeleniumGenerator,
                      Agent4TestExecutor, Agent5EvidenceVerifier, Agent6RecoveryController)
-from .agents.verifier import missing_oracle_evidence as _missing_oracle_evidence
-from .dom_inspector import compact_dom, inspect_page
+from .dom_inspector import compact_dom
 from .fixture_server import local_fixture, search_form
-from .generator import Agent3SeleniumGenerator
+from .selenium_runtime import inspect_page
 from .probe import merge_probe
 from .report import html_report
 from .schema import JSONModel
@@ -32,20 +29,6 @@ ARXIV_URL = "https://arxiv.org/search/advanced"
 
 def _write_json(path: Path, obj: dict | list):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
-
-
-def _run_script(script: Path, run_dir: Path, *, attempt: int, env: dict) -> dict:
-    """Compatibility hook; execution belongs to Agent4."""
-    return Agent4TestExecutor(root=ROOT, runner=subprocess.run).execute(
-        script, run_dir, attempt=attempt, env=env)
-
-
-def _run_probe(request: dict, run_dir: Path, base_url: str, *, env: dict,
-               headless: bool, demo_delay: float, allow_live: bool) -> dict:
-    """Compatibility hook; Pipeline has already authorized this probe."""
-    return Agent4TestExecutor(root=ROOT, runner=subprocess.run).probe(
-        request, run_dir, base_url, env=env, headless=headless,
-        demo_delay=demo_delay, allow_live=allow_live)
 
 
 def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixture',
@@ -145,7 +128,8 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
             else:
                 env = os.environ.copy()
                 env['PYTHONPATH'] = str(ROOT) + os.pathsep + env.get('PYTHONPATH', '')
-                evidence = _run_script(script, run_dir, attempt=1, env=env)
+                executor = Agent4TestExecutor(root=ROOT)
+                evidence = executor.execute(script, run_dir, attempt=1, env=env)
                 verifier = Agent5EvidenceVerifier()
                 verdict = verifier.verify(contract, evidence)
                 recovery_history = []
@@ -162,7 +146,7 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
                     new_script = generator.generate(contract, snapshot, run_dir, base_url=base_url,
                         headless=headless, demo_delay=demo_delay, mode='template', llm=None,
                         repair_request=repair, attempt=2)
-                    new_evidence = _run_script(new_script, run_dir, attempt=2, env=env)
+                    new_evidence = executor.execute(new_script, run_dir, attempt=2, env=env)
                     attempt_history.append({'attempt': 2, 'status': new_evidence.get('execution_status'),
                                             'error_stage': new_evidence.get('error_stage'), 'script': new_script.name})
                     verdict = verifier.verify(contract, new_evidence)
@@ -203,7 +187,7 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
                 if verdict.status == 'INCONCLUSIVE' and max_probes:
                     request = verifier.plan_probe(contract, evidence, verdict)
                     if request and (target != 'arxiv' or enable_live_probes and allow_live_site):
-                        probe = _run_probe(request, run_dir, base_url, env=env,
+                        probe = executor.probe(request, run_dir, base_url, env=env,
                                            headless=headless, demo_delay=demo_delay,
                                            allow_live=target == 'arxiv' and allow_live_site)
                         evidence = merge_probe(evidence, probe, request)
@@ -238,7 +222,6 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
     import time
     from .checked_selenium import origin, step_repair_context
     from .selenium_runtime import create_session, RuntimeLimits, ARTIFACT_ROOT
-    from .agents.generator import Agent3SeleniumGenerator
     from .schema import validate_dynamic_plan
     if not url or not requirement.strip():
         raise ValueError('Explicit URL and natural language requirement are required')

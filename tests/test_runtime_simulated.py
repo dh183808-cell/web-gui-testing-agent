@@ -11,7 +11,7 @@ import pytest
 from web_agent.agents import Agent1TestDesigner, Agent2TestReviewer, Agent5EvidenceVerifier
 from web_agent.dom_inspector import compact_dom
 from web_agent.fixture_server import search_form
-from web_agent.generator import find_locators
+from web_agent.agents.generator import find_locators
 from web_agent import selenium_runtime
 
 

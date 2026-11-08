@@ -15,7 +15,7 @@ from ..schema import JSONModel, QuerySpec, ORACLE_GUIDE, ORACLE_SOURCE_GUIDE, TA
 
 
 class Agent1TestDesigner:
-    """Use a model to interpret an arXiv SEARCH intent into a bounded query spec."""
+    """Design sourced Dynamic steps, or the retained bounded arXiv query spec."""
 
     def design_dynamic(self, requirement, *, url, llm, feedback=None, test_basis='', proposal_path=None):
         system = '''You are Agent1, a Web GUI test designer. Turn the original requirement into

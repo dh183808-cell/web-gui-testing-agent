@@ -6,13 +6,13 @@ from web_agent.agents import (Agent1TestDesigner, Agent2TestReviewer,
                               Agent5EvidenceVerifier, Agent6RecoveryController)
 from web_agent.dom_inspector import compact_dom
 from web_agent.fixture_server import search_form
-from web_agent.generator import Agent3SeleniumGenerator, find_locators
+from web_agent.agents.generator import Agent3SeleniumGenerator, find_locators
 from web_agent.pipeline import DEFAULT_REQUIREMENT
 
 
 def build():
     d = Agent1TestDesigner().design(DEFAULT_REQUIREMENT)
-    return Agent2TestReviewer().approve(d, target="fixture").to_dict()
+    return Agent2TestReviewer().build_contract(d, target="fixture").to_dict()
 
 
 def sample_evidence(bad=False):

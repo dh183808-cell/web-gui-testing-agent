@@ -84,6 +84,28 @@ def test_output_directory_cannot_escape_artifacts(tmp_path, monkeypatch):
         runtime.create_session(tmp_path / 'outside')
 
 
+@pytest.mark.parametrize('observation_fails', [False, True])
+def test_one_shot_inspection_always_closes_its_owned_browser(monkeypatch, observation_fails):
+    """The moved legacy adapter retains cleanup on success and DOM failure."""
+    from types import SimpleNamespace
+    from web_agent import dom_inspector
+    calls = []
+    driver = SimpleNamespace(get=lambda url:calls.append(url),quit=lambda:calls.append('quit'))
+    monkeypatch.setattr(runtime,'make_driver',lambda **kw:driver)
+    def observe(actual_driver):
+        assert actual_driver is driver
+        if observation_fails:
+            raise RuntimeError('synthetic DOM failure')
+        return {'title':'Observed page'}
+    monkeypatch.setattr(dom_inspector,'observe_session',observe)
+    if observation_fails:
+        with pytest.raises(RuntimeError,match='synthetic DOM failure'):
+            runtime.inspect_page('https://authorized.test/')
+    else:
+        assert runtime.inspect_page('https://authorized.test/')['title']=='Observed page'
+    assert calls==['https://authorized.test/','quit']
+
+
 def test_reviewed_asset_hash_matches_repository_source():
     path, digest = runtime.reviewed_script()
     assert path.is_file() and len(digest) == 64

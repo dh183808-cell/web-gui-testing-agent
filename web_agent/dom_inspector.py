@@ -9,7 +9,6 @@ from functools import lru_cache
 from pkgutil import get_data
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from bs4 import BeautifulSoup, Comment
-from .selenium_runtime import make_driver
 
 
 CONTROLS = 'input, select, button, textarea, a, form, [role="button"], [role="dialog"]'
@@ -264,12 +263,3 @@ return {html:document.documentElement.outerHTML.slice(0,2000001), live,
     snapshot['state_hash'] = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
     snapshot['observation_id'] = uuid.uuid4().hex
     return snapshot
-
-
-def inspect_page(url: str, *, headless: bool = True) -> dict:
-    driver = make_driver(headless=headless)
-    try:
-        driver.get(url)
-        return observe_session(driver)
-    finally:
-        driver.quit()

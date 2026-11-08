@@ -1,4 +1,4 @@
-"""CLI entrypoint for the six-agent prototype.
+"""CLI entrypoint for v0.5 Dynamic and retained fixture/template demonstrations.
 
 Examples:
   python run_demo.py --target fixture --mode template
@@ -15,7 +15,7 @@ from web_agent.pipeline import DEFAULT_REQUIREMENT, run_pipeline
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Six Agent arXiv Web GUI Testing Demo v0.3")
+    parser = argparse.ArgumentParser(description="WebAgent v0.5 — six-Agent dynamic Web GUI testing")
     parser.add_argument("--target", choices=["fixture", "fixture-bug", "arxiv", "dynamic"], default="fixture")
     parser.add_argument('--url', default=None, help='Explicit initial URL for dynamic GUI testing')
     parser.add_argument('--allow-local-research', action='store_true', help='Authorize checked local Selenium subset; not an OS sandbox')
