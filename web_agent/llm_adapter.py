@@ -100,6 +100,7 @@ class StructuredLLM:
             if headers:
                 kwargs["default_headers"] = headers
         self._client = OpenAI(**kwargs)
+        self.calls = []
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         # Every existing Agent prompt requires JSON; restating the constraint
@@ -114,7 +115,15 @@ class StructuredLLM:
         # Some OpenRouter downstream models do not support temperature=0.
         if self.provider != "openrouter":
             kwargs["temperature"] = 0
+        import time
+        started = time.monotonic()
         result = self._client.chat.completions.create(**kwargs)
+        usage = getattr(result, 'usage', None)
+        self.calls.append({'provider': self.provider, 'model': self.model,
+                           'response_id': getattr(result, 'id', None),
+                           'elapsed_seconds': round(time.monotonic()-started,3),
+                           'prompt_tokens': getattr(usage, 'prompt_tokens', None),
+                           'completion_tokens': getattr(usage, 'completion_tokens', None)})
         if not result.choices:
             raise ValueError("模型没有返回候选结果")
         choice = result.choices[0]

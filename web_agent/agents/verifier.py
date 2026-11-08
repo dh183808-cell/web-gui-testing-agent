@@ -9,15 +9,51 @@ The pipeline owns probe authorization, budget, execution and evidence merging.
 from __future__ import annotations
 
 import re
+import operator
 from typing import Any
 
 from ..evidence_plan import get_path
 from ..probe_plan import make_probe_request
-from ..schema import Verdict
+from ..schema import Verdict, NUMERIC_ORACLES, finite_number, validate_oracle_binding
 
 
 class Agent5EvidenceVerifier:
     """Evaluate contract-defined observables; do not synthesize missing evidence."""
+
+    def verify_dynamic(self, contract, evidence):
+        if evidence.get('execution_status') != 'COMPLETE':
+            return Verdict(status='ERROR', message='Formal Selenium execution did not complete')
+        checks = []
+        for oracle in contract['oracles']:
+            measurement = evidence.get('measurements', {}).get(oracle['id'], {})
+            actual = measurement.get('value')
+            expected = oracle['expected']
+            if measurement.get('read'):
+                try:
+                    validate_oracle_binding(oracle, measurement)
+                except ValueError as exc:
+                    return Verdict(status='ERROR',message='Formal evidence binding type error: '+str(exc))
+            if (actual is None or measurement.get('status', 'observed') != 'observed'
+                    or not measurement.get('observation_ref') or not measurement.get('screenshot_ref')
+                    or measurement.get('step_id', oracle.get('step_id')) != oracle.get('step_id')):
+                passed = None
+            elif oracle['kind'] == 'equals':
+                passed = type(actual) is type(expected) and actual == expected
+            elif oracle['kind'] == 'set_equals':
+                passed = isinstance(actual,list) and isinstance(expected,list) and sorted(actual)==sorted(expected)
+            elif oracle['kind'] in NUMERIC_ORACLES:
+                passed = (finite_number(actual) and finite_number(expected)
+                          and {'gte':operator.ge,'gt':operator.gt,'lte':operator.le,'lt':operator.lt}[oracle['kind']](actual,expected))
+            else:
+                passed = expected in actual if isinstance(actual,(str,list)) else False
+            checks.append(dict(oracle_id=oracle['id'], meaning=oracle['meaning'], expected=expected,
+                               actual=actual, passed=passed, observation_ref=measurement.get('observation_ref'),
+                               screenshot_ref=measurement.get('screenshot_ref'),
+                               binding={k: measurement[k] for k in ('by','selector','read','step_id','attribute') if k in measurement},
+                               evidence_status=measurement.get('status', 'observed')))
+        state = ('FAIL' if any(c['passed'] is False for c in checks) else
+                 'INCONCLUSIVE' if not checks or any(c['passed'] is None for c in checks) else 'PASS')
+        return Verdict(status=state, message='Formal DOM evidence compared with frozen expectations', checks=checks)
 
     @staticmethod
     def _norm(text: str) -> str:
