@@ -182,7 +182,14 @@ def main():
                                  service_log=run_dir / 'chromedriver.log', headless=config['headless'],
                                  page_load_strategy='eager' if config.get('research_mode') else 'normal')
             driver.get(base_url)
+            # Trusted control-side diagnostic; do not expose full command-line paths.
+            try:
+                chrome_args = driver.execute_cdp_cmd('Browser.getBrowserCommandLine', {})['arguments']
+                browser_headless = any(arg.startswith('--headless') for arg in chrome_args)
+            except Exception:
+                browser_headless = None  # Diagnostic availability must not break a session.
             reply({'status': 'READY', 'browser_session_id': driver.session_id,
+                   'browser_headless': browser_headless,
                    'browser_version': driver.capabilities.get('browserVersion'),
                    'profile_id': str(profile), 'data_id': base_url,
                    'initial_submissions': len(state['submissions']), 'base_url': base_url})

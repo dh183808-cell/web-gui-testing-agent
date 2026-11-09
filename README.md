@@ -1,11 +1,44 @@
-# WebAgent v0.5
+# WebAgent v0.6
 
 用六个逻辑 Agent 完成自然语言驱动的 Web GUI 功能测试。当前开发入口是
 `run_demo.py --target dynamic`：真实模型规划、实时 DOM 编码与有限调试、完整冷启动、
 独立 Chrome 正式重放和基于证据的判定。Selenium 保持为唯一浏览器自动化工具。
 
-v0.3 的 Fixture/固定 arXiv 模板入口仍供旧 CLI、Streamlit 和回归测试使用。
-这些入口不等于 v0.5 Dynamic；`app_ui.py` 尚未接入 Dynamic，本轮没有开发新前端。
+`app_ui.py` 是 Dynamic 单页面操作台，复用同一个六 Agent Pipeline。
+v0.3 的 Fixture/固定 arXiv 模板入口仍供旧 CLI 和回归测试使用。
+
+## 可视化操作台
+
+在下文配置好 ChromeDriver、Chrome 和控制侧 DeepSeek 凭据后启动：
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app_ui.py --server.address 127.0.0.1
+```
+
+打开终端显示的本地地址（默认 `http://127.0.0.1:8501`）。选择 A/B/C 预设或编辑
+目标 URL、可选 Test Basis 和 Test Requirement，确认本次授权后点击“开始测试”。
+A 预期 PASS；B 规定 Accepted! 而实际为 Received!，预期 FAIL；C 规定页面存在 Reset，
+实际缺失时预期 FAIL，并停止依赖的点击/清空步骤。预设只填输入，不提供固定模型答案或业务脚本。
+
+界面每秒更新真实事件、六 Agent/冷启动/Formal 状态、当前步骤、耗时、模型调用和失败修复次数。
+结果包含 Oracle 来源与正式实际值、正式截图、冻结源码和可下载报告。Agent6 只在需要时调用，
+不会为了展示进度强制运行。事件计数是适配器调用次数，不包含 SDK 内部网络重试。
+
+启动后输入配置折叠为只读，首屏展示八张阶段卡片、中文活动和模型本次等待时长。
+结果页优先展示失败 Oracle，或关键成功证据：并列对照来源条款、冻结预期和 Formal 实际值。
+每次只展示选定 Oracle/步骤的一张正式截图；未执行的依赖步骤单列，不计作已验证失败。
+代码、报告、JSON 和原始事件可在次级展开区查看与下载。
+
+前端固定 **Agent3 逐步调试及完整冷启动无头，Agent4 Formal 有头**；需在有桌面的 Windows
+会话中启动服务才能看到正式浏览器。Trial/Formal 独立 Profile、冻结源码和 Oracle 规则不变。
+没有 Headless 开关。下文 CLI 的默认全部无头和 `--show-browser` 行为保持兼容。
+
+任务在后台线程执行，刷新可通过地址栏 `?job=<id>` 回到同一任务。单个 Streamlit 服务一次
+只接受一个活动任务；重复点击复用同一 ID。结束后点击“新建测试任务”才能再次启动。
+`artifacts/ui_jobs/` 保存任务事件及状态；服务重启只恢复记录并标记中断，不自动重跑或调用 API。
+左侧“最近任务”可只读查看最近 20 项保存记录；切换历史不调用模型或启动被测浏览器。
+执行中可查看历史并返回活动任务，此时不能新开任务。
+当前没有取消按钮、跨服务器任务调度或远程多用户权限控制；请仅绑定本机访问。
 
 ## 本地运行
 
@@ -83,6 +116,7 @@ CLI 对 PASS 或仅规划正常返回 0；FAIL、ERROR、INCONCLUSIVE 的完整�
 | `checked_selenium.py`、`rendered_text.js` | 受限 Selenium 解释与统一取证，完整正文读取、去重、必要目标清点 |
 | `dom_inspector.py` | 观察已有 driver，批量 DOM 提取、压缩和脱敏；不创建浏览器 |
 | `llm_adapter.py` | 控制侧模型配置和 API 调用 |
+| `ui_tasks.py`、`app_ui.py` | 后台任务防重/刷新恢复、只读进度快照与单页操作台；执行仍委托原 Pipeline |
 | `fixture_server.py` | 本地合成页面与可独立重置的服务端数据，供回归与基础设施验收 |
 | `evidence_plan.py`、`probe_plan.py`、`probe.py`、`probe_runner.py` | 旧模板的检查点取证和受限详情补证；非 Dynamic 业务路径 |
 | `report.py` | 旧模板 HTML 报告；Dynamic 当前保存 JSON 与 `report.md` |
@@ -123,8 +157,13 @@ Worker 不继承模型凭据；禁止任意 Python、Shell、反射和系统文�
 全面负面证明尚不支持；证据不足保持 INCONCLUSIVE，技术故障仍为 ERROR。
 浏览器 Profile 重置不等于远端服务端数据重置，有副作用操作需授权及可重放环境。
 
-本轮架构清理的基线、模块依赖前后对比、删除理由、pytest 与三项真实模型/Chrome
+v0.5 架构清理的基线、模块依赖前后对比、删除理由、pytest 与三项真实模型/Chrome
 回归记录见 `docs/v05_architecture_cleanup_acceptance.md` 和
 `artifacts/v05_architecture_cleanup/`。Mock 测试不替代真实端到端验收。
 `AGENTS.md`、`docs/` 和运行产物当前被 `.gitignore` 忽略，不会自动同步到其他克隆；
 README 和源码中的说明可随仓库共享。
+
+v0.6 前端及分阶段浏览器模式的验收见 `docs/v06_frontend_acceptance.md` 与
+`artifacts/v06_ui_acceptance/`；未通过的真实运行不会以离线测试替代。
+本轮演示布局、历史查看和证据选择优化见 `docs/v06_presentation_acceptance.md` 与
+`artifacts/v06_presentation_acceptance/`，真实验收严格限于 A/B 各一次。

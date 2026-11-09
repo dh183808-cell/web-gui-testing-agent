@@ -198,6 +198,7 @@ class LocalSession:
         self.run_dir = root / purpose / self.session_id
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.research_mode = research_mode
+        self.progress_callback = None
         self._options = dict(headless=headless, driver_path=driver_path, chrome_binary=chrome_binary,
                              start_url=start_url, research_mode=research_mode)
         self._root = root
@@ -209,6 +210,7 @@ class LocalSession:
         self.cleanup = {'process_tree_terminated': False, 'owned_processes_remaining': None,
                         'profile_removed': False, 'driver_quit': False}
         self.metadata = dict(session_id=self.session_id, purpose=purpose, seed=seed,
+                             headless=headless,
                              limits=asdict(self.limits), status='STARTING', execution_mode='local_trusted',
                              security_sandbox=False)
         self._exit_handler = self.close_session
@@ -336,13 +338,25 @@ class LocalSession:
     def execute_checked(self, source, *, step_id=None, queries=None):
         """Research opt-in: interpret a bounded Selenium subset; never arbitrary Python."""
         if getattr(self, 'research_mode', False):
-            return self._execute_research(source, step_id=step_id, queries=queries or {})
+            self._progress('step_started', step_id=step_id)
+            result = self._execute_research(source, step_id=step_id, queries=queries or {})
+            self._progress('step_finished', step_id=step_id, status=result['status'],
+                           timings=result.get('timings'), elapsed_seconds_step=result.get('elapsed_seconds'))
+            return result
         result = dict(status='REJECTED', error_type='UntrustedCodeDisabled',
                       error='Arbitrary Python execution is disabled in local mode; use a reviewed script ID',
                       session_id=self.session_id, purpose=self.purpose, elapsed_seconds=0,
                       current_url=self._last_url, observation_ref=self._last_observation_ref, cleanup=dict(self.cleanup))
         self._write('rejection_' + uuid.uuid4().hex + '.json', result)
         return result
+
+    def _progress(self, action, **data):
+        callback = getattr(self, 'progress_callback', None)
+        if callback:
+            try:
+                callback(action, session_id=self.session_id, **data)
+            except Exception:
+                pass
 
     def _execute_research(self, source, *, step_id, queries):
         from .checked_selenium import validate_source, normalize_bindings

@@ -1,155 +1,271 @@
-"""Streamlit UI for the six-agent arXiv demo.
-
-Run: streamlit run app_ui.py
-"""
-from pathlib import Path
+"""Streamlit presentation of the existing Dynamic Pipeline; no execution logic."""
+from html import escape
+import json
+import uuid
 
 import streamlit as st
-from web_agent.pipeline import DEFAULT_REQUIREMENT, run_pipeline
 
-st.set_page_config(page_title="Web GUI Testing Agent · v0.3", page_icon="🧪", layout="wide")
-st.markdown("""
-<style>
-.block-container{max-width:1240px;padding-top:2.4rem}
-.hero{background:linear-gradient(115deg,#132a53,#255d88);color:white;padding:30px 35px;border-radius:16px;margin-bottom:18px}
-.hero h1{color:white;font-size:34px;letter-spacing:-.4px;margin:0 0 5px}
-.hero p{color:#cee3f9;margin:0}
-.role{border:1px solid #dfe8f4;background:#f9fbff;border-radius:12px;padding:15px 12px;min-height:107px}
-.role strong{display:block;color:#183c68;margin-bottom:5px}
-.role small{color:#536e8d;font-size:12px}
-</style>""", unsafe_allow_html=True)
-st.markdown('<div class="hero"><h1>Web GUI Testing Agent <span style="font-size:17px">v0.3</span></h1>'
-            '<p>arXiv 研究检索 · 六角色协作 · Selenium 执行 · 证据驱动验证</p></div>',
-            unsafe_allow_html=True)
-roles = [
-    ("Agent1", "测试用例设计"), ("Agent2", "用例审核 / Evidence Plan"),
-    ("Agent3", "DOM + LLM 定位方案"), ("Agent4", "浏览器执行 / 取证"),
-    ("Agent5", "跨页面验证"), ("Agent6", "报告 / 恢复决策"),
-]
-cols = st.columns(6)
-for col, (name, desc) in zip(cols, roles):
-    col.markdown(f'<div class="role"><strong>{name}</strong><small>{desc}</small></div>',
-                 unsafe_allow_html=True)
-st.write("")
-left, right = st.columns([1.2, 0.8], gap="large")
-with left:
-    st.subheader("测试任务")
-    requirement = st.text_area("自然语言测试要求", value=DEFAULT_REQUIREMENT, height=112)
-    target_label = st.selectbox("被测环境", ["本地 arXiv 风格仿真页（正常）", "本地 arXiv 风格仿真页（受控缺陷）", "真实 arxiv.org（需符合站点规则）"])
-    target = ["fixture", "fixture-bug", "arxiv"][
-        ["本地 arXiv 风格仿真页（正常）", "本地 arXiv 风格仿真页（受控缺陷）", "真实 arxiv.org（需符合站点规则）"].index(target_label)]
-with right:
-    st.subheader("执行配置")
-    mode_label = st.radio("Agent1/2/3 运行模式", ["模板演示（无需 API Key）", "真实 LLM（DeepSeek / OpenRouter / OpenAI）"], index=0)
-    mode = "llm" if mode_label.startswith("真实") else "template"
-    provider = None
-    model = None
-    if mode == "llm":
-        provider_label = st.selectbox("模型服务商", ["DeepSeek", "OpenRouter", "OpenAI"], index=0)
-        provider = {"DeepSeek": "deepseek", "OpenRouter": "openrouter", "OpenAI": "openai"}[provider_label]
-        model_hint = {"deepseek": "deepseek-flash（默认）", "openrouter": "例如 provider/model（以 OpenRouter 当前列表为准）", "openai": "gpt-4.1-mini（默认）"}[provider]
-        model = st.text_input("模型名称（留空使用 .env 或服务商默认值）", value="",
-                              placeholder=model_hint) or None
-        st.caption("密钥由 .env 或环境变量读取：DEEPSEEK_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY。")
-    headless = st.checkbox("无界面浏览器（后台截图）", value=True)
-    demo_delay = st.slider("可视化演示停顿（秒）", min_value=0.0, max_value=2.0, value=0.0, step=0.25,
-                           disabled=headless)
-    only_generate = st.checkbox("只生成脚本，不运行浏览器", value=False)
-    recovery_on = st.checkbox("Agent6：允许最多一次定位器局部恢复", value=True)
-    probe_on = st.checkbox("Agent5：允许最多一次定向补证", value=True)
-    injection = "无"
-    if target != "arxiv" and not only_generate:
-        injection = st.selectbox("演示故障注入（仅本地仿真页）",
-            ["无", "模拟缺失详情标题证据（Agent5）", "模拟关键词定位器失效（Agent6）"])
-    enable_live_probes = enable_live_recovery = False
-    if target == "arxiv":
-        st.caption("真实站点默认不会自动重复访问或修复重跑，需要额外单独确认。")
-        enable_live_probes = st.checkbox("单独允许一次真实站点定向补证", value=False)
-        enable_live_recovery = st.checkbox("单独允许一次真实站点定位故障恢复重跑", value=False)
-    allow_live = st.checkbox("我已确认目标站点允许此次低频测试，不做批量抓取或绕过访问限制", value=False) if target == "arxiv" else False
-    st.caption("模板模式：固定打开论文详情，关键词从引号提取。LLM 模式：支持只搜索/进入详情、字段筛选和计算机科学分类；不支持任意网站或任意任务。")
-run = st.button("▶ 开始六 Agent 测试", type="primary", use_container_width=True)
-if run:
-    if target == "arxiv" and not allow_live:
-        st.error("请先确认目标网站自动化访问符合适用规则。")
-    else:
-        with st.spinner("正在构建测试契约、生成 Selenium 脚本并处理执行证据…"):
-            try:
-                st.session_state["result"] = run_pipeline(
-                    requirement=requirement, target=target, mode=mode,
-                    headless=headless, demo_delay=demo_delay, allow_live_site=allow_live,
-                    only_generate=only_generate, provider=provider, model=model,
-                    max_probes=int(probe_on), max_repairs=int(recovery_on),
-                    enable_live_probes=enable_live_probes,
-                    enable_live_recovery=enable_live_recovery,
-                    demo_evidence_gap=injection.startswith("模拟缺失"),
-                    demo_broken_locator=injection.startswith("模拟关键词"))
-            except Exception as e:
-                st.error(f"执行未完成：{type(e).__name__}: {e}")
-if "result" in st.session_state:
-    r = st.session_state["result"]
-    v = r["verdict"]
+from web_agent.ui_tasks import (DEMO_PRESETS, STAGE_LABELS, TaskStore, artifact_path,
+                                progress_view, read_json, result_view)
+
+
+st.set_page_config(page_title='WebAgent · 测试操作台', page_icon='🧪', layout='wide')
+st.markdown('''<style>
+.block-container{max-width:1660px;padding-top:1.4rem;padding-bottom:2rem}
+h1{font-size:1.85rem!important;padding-bottom:.3rem!important}
+h2{font-size:1.4rem!important} h3{font-size:1.1rem!important}
+[data-testid="stMetricValue"]{font-size:1.5rem}
+.stage{border:1px solid #dce3ed;border-radius:10px;padding:10px 13px;margin:3px 0 8px;background:#f8fafc;min-height:83px}
+.stage.active{border-color:#2a64bc;background:#edf4ff;box-shadow:inset 3px 0 #2a64bc}
+.stage.done{border-color:#bbdaca;background:#f4faf6}
+.stage.error{border-color:#e4b4b4;background:#fff3f2}
+.stage strong{font-size:14px;color:#18354f;display:block;margin-bottom:6px}
+.stage span{font-size:13px;color:#526477}
+.result-title{font-size:29px;font-weight:750;line-height:1.3;margin:8px 0 5px}
+.muted{color:#66758a;font-size:14px}
+.oracle-value{border:1px solid #dce3ed;border-radius:8px;padding:10px 13px;background:#f8fafc;overflow-wrap:anywhere;white-space:pre-wrap;font-size:19px}
+</style>''', unsafe_allow_html=True)
+
+
+@st.cache_resource
+def task_store():
+    return TaskStore()
+
+
+store = task_store()
+active_id = store.active()
+selected_id = st.query_params.get('job') or active_id
+selected = store.snapshot(selected_id) if selected_id else None
+if selected and st.query_params.get('job') != selected_id: st.query_params['job'] = selected_id
+
+
+def select_history():
+    key = st.session_state['history_job']
+    if key: st.query_params['job'] = key
+
+
+def new_task():
+    st.query_params.clear()
+    st.session_state['request_id'] = uuid.uuid4().hex
+    st.session_state['authorized'] = False
+    st.session_state['history_job'] = None
+    st.session_state.pop('displayed_job', None)
+
+
+with st.sidebar:
+    st.markdown('### WebAgent v0.6')
+    st.caption('测试操作台 · 本地单任务服务')
+    if active_id:
+        st.info('有一个任务正在执行')
+        if st.button('返回正在运行的任务', key='return_active'):
+            st.query_params['job'] = active_id
+            st.rerun()
+    st.button('新建测试任务', key='new_task', on_click=new_task, disabled=bool(active_id))
+    recent = store.recent()
+    labels = {row['id']: row['label'] for row in recent}
+    options = [None, *labels]
+    if selected_id in labels:
+        st.session_state['history_job'] = selected_id
+    elif st.session_state.get('history_job') not in options:
+        st.session_state['history_job'] = None
+    st.selectbox('最近任务 · 只读查看', options, key='history_job',
+                 format_func=lambda key: labels.get(key, '选择历史任务'), on_change=select_history)
+    st.caption('查看记录不会调用 DeepSeek 或启动 Chrome。历史依据和需求不能在原任务内修改。')
     st.divider()
-    st.subheader("运行结果")
-    if v["status"] == "PASS":
-        st.success(f'PASS · {v["message"]}')
-    elif v["status"] == "FAIL":
-        st.error(f'FAIL · {v["message"]}')
+    st.caption('Agent3 / Cold Trial：后台无头\n\nAgent4 Formal：独立可见 Chrome\n\n刷新后继续查看同一任务。')
+
+st.title('WebAgent · Web GUI 测试操作台')
+if selected:
+    st.caption(('正在执行' if selected['status'] == 'RUNNING' else '历史任务 · 只读')
+               + '  /  ' + selected_id + '  ·  真实模型与正式证据')
+else:
+    st.caption('配置测试 → 六 Agent 执行 → 独立正式取证 → 对照冻结预期判定')
+if selected_id and not selected:
+    st.warning('未找到任务记录。请从左侧选择历史任务或新建任务；不会自动重新执行。')
+
+
+def apply_preset():
+    preset = DEMO_PRESETS.get(st.session_state['preset'])
+    if preset: st.session_state.update(preset)
+
+
+def configure():
+    if 'url' not in st.session_state: st.session_state.update(next(iter(DEMO_PRESETS.values())))
+    st.session_state.setdefault('request_id', uuid.uuid4().hex)
+    with st.container(border=True):
+        st.subheader('配置本次测试')
+        st.selectbox('Demo 预设（可自由编辑）', ['自定义', *DEMO_PRESETS], key='preset', on_change=apply_preset)
+        st.text_input('目标 URL', key='url')
+        left, right = st.columns(2)
+        with left: st.text_area('Test Basis · 测试依据（可选）', key='test_basis', height=145)
+        with right: st.text_area('Test Requirement · 测试需求', key='requirement', height=145)
+        st.caption('预设 B/C 是人为构造的错误规格，不代表网站存在缺陷。无测试依据时，仅验证用户明确的验收条件。')
+        consent = st.checkbox('我授权此次站点测试与独立重跑，并确认使用可安全重复的测试数据', key='authorized')
+        if st.button('开始测试', key='start_test', type='primary', disabled=not consent or bool(active_id)):
+            try:
+                job_id = store.start({key: st.session_state[key] for key in ('url', 'test_basis', 'requirement')},
+                                     request_id=st.session_state['request_id'])
+                st.query_params['job'] = job_id
+                st.rerun()
+            except (ValueError, KeyError) as exc: st.error(str(exc))
+    st.caption('DeepSeek 凭据由控制侧已有配置读取；前端不接收密钥。本地受限解释器不是操作系统沙箱。')
+
+
+def readonly_config(job):
+    with st.expander('本次测试配置 · 只读', expanded=False):
+        st.text('URL：' + job['inputs']['url'])
+        st.write('测试依据'); st.text(job['inputs'].get('test_basis') or '未提供')
+        st.write('测试需求'); st.text(job['inputs']['requirement'])
+
+
+def stage_cards(view):
+    names = list(view['stages'])
+    for offset in (0, 4):
+        for col, name in zip(st.columns(4), names[offset:offset+4]):
+            state = view['stages'][name]
+            style = {'执行中': 'active', '已完成': 'done', '异常': 'error'}.get(state['status'], '')
+            clock = f"{state['seconds']:.1f}s" if state['seconds'] is not None else '—'
+            col.markdown(f'<div class="stage {style}"><strong>{escape(STAGE_LABELS[name])}</strong>'
+                         f'<span>{escape(state["status"])} · {clock}</span></div>', unsafe_allow_html=True)
+
+
+def progress_panel(job):
+    view = progress_view(job)
+    running = job['status'] == 'RUNNING'
+    current = STAGE_LABELS.get(view['current'], view['current'])
+    st.subheader(('正在执行 · ' + current) if running else '执行记录')
+    cols = st.columns([1.25, 1, 1.25, 1, 1])
+    values = [view['step'], f"{view['elapsed']:.1f}s", f"{view['calls_finished']} / {view['calls']}",
+              f"{view['current_seconds'] or 0:.1f}s" if running else '已结束', f"{view['repairs']} / 5"]
+    for col, title, value in zip(cols, ['当前步骤', '总耗时', 'LLM 已结束 / 已发起', '当前阶段耗时', '失败修复'], values): col.metric(title, value)
+    stage_cards(view)
+    if view['pending_seconds'] is not None:
+        st.info(f"正在等待 DeepSeek 返回 · 本次已等待 {view['pending_seconds']:.1f} 秒 · "
+                f"{current} · 未结束调用 {view['calls']-view['calls_finished']} 个")
+    elif view['formal_open']:
+        st.info('正式浏览器已启动 · Agent4 正在独立执行 ' + view['step'] + ' · 结束后自动关闭')
+    elif running:
+        latest = view['activities'][-1]['text'] if view['activities'] else '等待首条执行事件'
+        st.info('当前活动：' + latest)
+    with st.container(border=True):
+        st.markdown('**最新活动**')
+        for item in reversed(view['activities'][-5:]):
+            st.text(f"{item['seconds']:6.1f}s  {item['text']}")
+    readonly_config(job)
+    with st.expander('完整原始事件日志', expanded=False):
+        st.caption('阶段耗时根据事件归属累计，包含等待；Agent4 与 Formal 描述同一段正式执行。模型计数不含 SDK 内部重试。')
+        st.json(job.get('events', []), expanded=False)
+        st.download_button('下载事件日志', json.dumps(job.get('events', []), ensure_ascii=False, indent=2),
+                           file_name='events.json', key='events_' + job['id'])
+
+
+def format_value(value):
+    return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def show_results(job):
+    view = result_view(job)
+    verdict, rows = view['verdict'], view['rows']
+    status = verdict['status']
+    color = {'PASS': '#20704b', 'FAIL': '#b63636', 'ERROR': '#b63636', 'INCONCLUSIVE': '#97610c'}.get(status, '#18354f')
+    meaning = {'PASS': '正式行为符合冻结预期', 'FAIL': '正式证据确认与冻结预期不符',
+               'ERROR': '技术执行未能完成', 'INCONCLUSIVE': '尚不能可靠判定'}
+    st.markdown(f'<div class="result-title" style="color:{color}">{escape(status)} · {meaning.get(status, "测试结果")}</div>', unsafe_allow_html=True)
+    pv = progress_view(job)
+    st.caption(f"总耗时 {pv['elapsed']:.1f}s  ·  LLM {pv['calls']} 次  ·  失败修复 {pv['repairs']} 次  ·  仅使用独立 Formal 正式证据")
+    if verdict.get('error_type'): st.error(verdict['error_type'] + ' · ' + verdict.get('failed_stage', ''))
+    if job['status'] == 'INTERRUPTED': st.warning('服务重启后任务中断；未自动恢复或重跑。')
+    for issue in verdict.get('issues', []): st.write(issue)
+    if rows:
+        mode = st.radio('正式证据查看方式', ['按 Oracle', '按执行步骤'], horizontal=True, key='evidence_mode_' + job['id'])
+        if mode == '按 Oracle':
+            options = [row['oracle_id'] for row in rows]
+            focus = view['focus']['oracle_id']
+            oid = st.selectbox('选择 Oracle · 默认优先关键结论', options, index=options.index(focus),
+                format_func=lambda key: next(f"{r['oracle_id']} / {r['step_id']} · {r['status']} · {r['meaning']}" for r in rows if r['oracle_id'] == key),
+                key='oracle_' + job['id'])
+            row = next(r for r in rows if r['oracle_id'] == oid)
+            left, right = st.columns([.85, 1.15], gap='large')
+            with left:
+                st.subheader(row['oracle_id'] + ' · ' + row['status'])
+                st.write(row['meaning'])
+                st.caption({'test_basis': '来自测试依据', 'user_requirement': '来自用户验收条件'}.get(row['source_type'], row['source_type']))
+                st.text(row['source_quote'] or '未记录来源引文')
+                st.markdown('**冻结预期**')
+                st.markdown('<div class="oracle-value">' + escape(format_value(row['expected'])) + '</div>', unsafe_allow_html=True)
+                st.markdown('**Formal 正式实际值**')
+                actual = format_value(row['actual']) if row['actual_available'] else '未执行，未采集实际值' if row['status'] == 'NOT_EXECUTED' else '缺少正式测量值'
+                st.markdown('<div class="oracle-value">' + escape(actual) + '</div>', unsafe_allow_html=True)
+                if row['status'] == 'NOT_EXECUTED': st.info('前置条件阻塞：' + (row['blocked_by'] or '详见执行记录') + '。此项未验证，不作为已证实失败。')
+            with right:
+                st.markdown('**对应 Agent4 正式截图**')
+                if row['screenshot']:
+                    st.image(str(row['screenshot']), width='stretch', caption=row['oracle_id'] + ' / ' + row['step_id'] + ' · Formal')
+                    st.download_button('下载当前正式截图', row['screenshot'].read_bytes(), file_name=row['screenshot'].name, key='shot_' + job['id'])
+                else: st.info('该 Oracle 没有可用的正式截图。')
+        else:
+            steps = view['steps']
+            if steps:
+                sid = st.selectbox('选择正式执行步骤', [s['step_id'] for s in steps], key='step_' + job['id'])
+                step = next(s for s in steps if s['step_id'] == sid)
+                st.write(sid + ' · ' + step['status']); st.caption(step['current_url'])
+                if step['screenshot']: st.image(str(step['screenshot']), width='stretch', caption=sid + ' · Formal')
+                else: st.info('此步骤未保存正式截图。')
+            else: st.info('没有正式步骤记录。')
+        with st.expander('全部 Oracle 对比', expanded=False):
+            st.dataframe([{'Oracle': r['oracle_id'], '步骤': r['step_id'], '判定': r['status'],
+                '测试依据 / 验收条件': r['source_quote'], '冻结预期': format_value(r['expected']),
+                '正式实际值': format_value(r['actual']) if r['actual_available'] else '未采集'} for r in rows],
+                hide_index=True, width='stretch')
+    else: st.info('本次没有可对照的正式 Oracle 证据。' + verdict.get('message', ''))
+    if view['skipped']:
+        with st.container(border=True):
+            st.markdown('**未执行的依赖步骤 · NOT_EXECUTED**')
+            for item in view['skipped']:
+                st.write(item['step_id'] + '：被 ' + item['blocked_by'] + ' 阻塞，后续依赖操作未执行。')
+            st.caption('未执行不等于已验证失败；总 FAIL 来自前置 Oracle 的可靠正式证据。')
+    with st.expander('代码、报告与完整 JSON 证据', expanded=False):
+        code, report, evidence = st.tabs(['冻结 Selenium 代码', '报告', '完整证据'])
+        run = view['run_dir']
+        with code:
+            path = artifact_path(run, 'generated_test.py')
+            if path:
+                st.code(path.read_text(encoding='utf-8'), language='python')
+                st.download_button('下载生成代码', path.read_bytes(), file_name='generated_test.py')
+            else: st.info('尚未交付脚本。')
+        with report:
+            path = artifact_path(run, 'report.md')
+            if path:
+                st.text(path.read_text(encoding='utf-8'))
+                st.download_button('下载报告', path.read_bytes(), file_name='report.md', mime='text/markdown')
+        with evidence:
+            st.caption('运行目录：' + str(run))
+            for name in ('test_inputs.json', 'test_contract.json', 'agent3_delivery.json', 'formal_evidence.json',
+                         'final_verdict.json', 'cleanup.json', 'llm_calls.json', 'agent3_debug.json'):
+                path = artifact_path(run, name)
+                if path:
+                    with st.expander(name):
+                        st.json(read_json(path, {}), expanded=False)
+                        st.download_button('下载 ' + name, path.read_bytes(), file_name=name, key='file_' + name)
+
+
+def render_task(job_id):
+    job = store.snapshot(job_id)
+    if not job: return None
+    if job['status'] == 'RUNNING': progress_panel(job)
     else:
-        st.warning(f'{v["status"]} · {v["message"]}')
-    st.caption("运行目录：" + r["run_dir"] + " · DOM 来源：" + r["inspector"].get("inspector_source", "unknown"))
-    if r["evidence"].get("error_stage"):
-        st.info("Selenium 失败阶段：" + r["evidence"]["error_stage"])
-        if r["evidence"].get("diagnostics"):
-            with st.expander("浏览器失败现场诊断"):
-                st.json(r["evidence"]["diagnostics"])
-    stage_cols = st.columns(6)
-    for col, s in zip(stage_cols, r["stages"]):
-        col.metric(s["agent"], s["result"])
-    t1, t2, t3, t4, t5, t6 = st.tabs(["Agent2 审核与预言", "Agent3 生成决策", "浏览器截图", "Selenium 代码", "Agent4～6 证据与恢复", "测试产物"])
-    with t1:
-        st.write("独立审核结果")
-        st.json(r.get("reviews", []))
-        st.write("验证结果")
-        st.json(v["checks"])
-        st.write("冻结的测试契约")
-        st.json(r["contract"])
-    with t2:
-        p = Path(r["run_dir"]) / "generation_audit.json"
-        if p.exists():
-            st.json(__import__("json").loads(p.read_text(encoding="utf-8")))
-        p = Path(r["run_dir"]) / "locator_plan.json"
-        if p.exists():
-            st.json(__import__("json").loads(p.read_text(encoding="utf-8")))
-    with t3:
-        images = r["evidence"].get("screenshots", [])
-        if not images:
-            st.info("没有可用截图。检查 runner.log 是否为浏览器依赖或网络错误。")
-        for name in images:
-            p = Path(r["run_dir"]) / name
-            if p.exists():
-                st.image(str(p), caption=name)
-    with t4:
-        p = Path(r["run_dir"]) / "generated_test.py"
-        st.code(p.read_text(encoding="utf-8"), language="python")
-    with t5:
-        st.write("Agent4 按 Evidence Plan 采集的记录")
-        st.json(r["evidence"].get("collection_log", []))
-        st.write("Agent5 主动补证")
-        st.json(r["evidence"].get("probes", []))
-        st.write("Agent6 受控恢复 / 运行次数")
-        st.json({"attempts": r["evidence"].get("attempt_history", []),
-                 "recovery": v.get("recovery_history", []),
-                 "probe_count": r.get("probe_count", 0),
-                 "repair_count": r.get("repair_count", 0)})
-    with t6:
-        p = Path(r["report"])
-        st.download_button("下载 HTML 报告", p.read_bytes(), file_name="report.html", mime="text/html")
-        for name in ["draft_cases.json", "review_decision.json", "test_contract.json", "dom_snapshot.json", "locator_plan.json", "generation_audit.json", "evidence.json", "final_verdict.json", "runner.log", "failure_diagnostics.json", "probe_request.json", "probe_result.json",
-                     "repair_request.json", "recovery_history.json", "evidence_attempt2.json",
-                     "locator_plan_attempt2.json", "generation_audit_attempt2.json",
-                     "controlled_evidence_gap.json"]:
-            item = Path(r["run_dir"]) / name
-            if item.exists():
-                with st.expander(name):
-                    st.code(item.read_text(encoding="utf-8")[:15000])
+        show_results(job)
+        readonly_config(job)
+        with st.expander('阶段时间线与完整活动记录', expanded=False): progress_panel(job)
+    return job['status']
+
+
+@st.fragment(run_every='1s')
+def live_task(job_id):
+    if render_task(job_id) != 'RUNNING': st.rerun()
+
+
+if selected:
+    if selected['status'] == 'RUNNING': live_task(selected_id)
+    else: render_task(selected_id)
+elif not selected_id: configure()

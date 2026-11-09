@@ -127,10 +127,17 @@ def test_presence_field_on_value_oracle_reports_exact_problem(tmp_path):
     assert draft.exists() and draft.with_suffix('.validation.json').exists()
 
 
-def test_reviewed_prefix_is_cold_replayed_and_formally_verified_without_dependent_codegen(tmp_path,monkeypatch):
+@pytest.mark.parametrize('headless,formal_headless,expected_modes', [
+    (True,None,[True,True,True]), (False,None,[False,False,False]),
+    (True,False,[True,True,False]),
+])
+def test_reviewed_prefix_is_cold_replayed_and_formally_verified_without_dependent_codegen(
+        tmp_path,monkeypatch,headless,formal_headless,expected_modes):
     from web_agent import selenium_runtime as runtime
     from web_agent.pipeline import run_pipeline
     created=[]
+    modes=[]
+    events=[]
     generated=[]
     basis='Visible Clear button; clicking Clear empties input.'
     class Model:
@@ -157,14 +164,19 @@ def test_reviewed_prefix_is_cold_replayed_and_formally_verified_without_dependen
             return dict(execution_status='COMPLETE',purpose=self.purpose,browser_session_id=str(len(created)),
                         script_sha256=hashlib.sha256(source.encode()).hexdigest(),measurements={'O1':formal_measurement()})
     def create(*args,purpose,**kw):
+        modes.append(kw['headless'])
         s=Session(purpose);created.append(s);return s
     monkeypatch.setattr(runtime,'ARTIFACT_ROOT',tmp_path)
     monkeypatch.setattr(runtime,'create_session',create)
     result=run_pipeline(target='dynamic',mode='llm',requirement='Fill input and check Clear; if present click it.',
         test_basis=basis,start_url='https://authorized.test/form',allow_live_site=True,
-        allow_local_research=True,output_root=tmp_path,llm=Model())
+        allow_local_research=True,output_root=tmp_path,llm=Model(),headless=headless,
+        formal_headless=formal_headless,progress_callback=events.append)
     assert result['verdict']['status']=='FAIL'
     assert generated==['S1','S2'] and [s.purpose for s in created]==['trial','trial','formal']
+    assert modes == expected_modes
+    assert events[0]['action']=='run_started' and events[-1]['action']=='run_finished'
+    assert sum(e['action']=='call_started' for e in events)==sum(e['action']=='call_finished' for e in events)
     assert result['verdict']['skipped_steps'][0]['step_id']=='S3'
     from pathlib import Path
     delivery=json.loads((Path(result['run_dir'])/'agent3_delivery.json').read_text(encoding='utf-8'))

@@ -1,5 +1,5 @@
 selenium>=4.20,<5
-streamlit>=1.40,<3
+streamlit>=1.66,<3
 beautifulsoup4>=4.12
 openai>=1.30
 pytest>=8
