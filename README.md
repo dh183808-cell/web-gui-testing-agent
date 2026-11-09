@@ -9,22 +9,27 @@ v0.3 的 Fixture/固定 arXiv 模板入口仍供旧 CLI 和回归测试使用。
 
 ## 可视化操作台
 
-在下文配置好 ChromeDriver、Chrome 和控制侧 DeepSeek 凭据后启动：
+在下文配置好 ChromeDriver、Chrome 后启动：
 
 ```powershell
 .\.venv\Scripts\python.exe -m streamlit run app_ui.py --server.address 127.0.0.1
 ```
 
-打开终端显示的本地地址（默认 `http://127.0.0.1:8501`）。选择 A/B/C 预设或编辑
-目标 URL、可选 Test Basis 和 Test Requirement，确认本次授权后点击“开始测试”。
-A 预期 PASS；B 规定 Accepted! 而实际为 Received!，预期 FAIL；C 规定页面存在 Reset，
-实际缺失时预期 FAIL，并停止依赖的点击/清空步骤。预设只填输入，不提供固定模型答案或业务脚本。
+打开终端显示的本地地址（默认 `http://127.0.0.1:8501`）。选择 DeepSeek、OpenAI、
+OpenRouter 或硅基流动，填写可编辑的模型 ID 和本次 API Key，再填写目标 URL、
+可选测试依据和测试需求，确认授权后点击“开始测试”。高级设置可修改 API Base URL、
+JSON 输出模式，也可单独发送一次小型请求测试连接。连接成功不等于完整 Pipeline 验收成功。
+模型 ID/接口地址可从 `.env` 同名公开字段读取；Key 不预填、不回退后台 Key，不写入任务、
+证据、日志或生成代码。只在控制侧内存调用模型，启动后清除页面密码框；查看历史无需 Key。
+`.env.example` 包含四个服务商的 CLI 配置示例。A/B/C 原始输入仍保留在开发材料和回归测试，
+正常操作界面不再提供 Demo 下拉框。
 
 界面每秒更新真实事件、六 Agent/冷启动/Formal 状态、当前步骤、耗时、模型调用和失败修复次数。
 结果包含 Oracle 来源与正式实际值、正式截图、冻结源码和可下载报告。Agent6 只在需要时调用，
 不会为了展示进度强制运行。事件计数是适配器调用次数，不包含 SDK 内部网络重试。
 
-启动后输入配置折叠为只读，首屏展示八张阶段卡片、中文活动和模型本次等待时长。
+启动后输入配置折叠为只读，首屏展示六张阶段卡片、中文活动和模型本次等待时长。
+Agent4 与正式执行合并展示；异常诊断仅在实际调用时显示。
 结果页优先展示失败 Oracle，或关键成功证据：并列对照来源条款、冻结预期和 Formal 实际值。
 每次只展示选定 Oracle/步骤的一张正式截图；未执行的依赖步骤单列，不计作已验证失败。
 代码、报告、JSON 和原始事件可在次级展开区查看与下载。
@@ -32,6 +37,9 @@ A 预期 PASS；B 规定 Accepted! 而实际为 Received!，预期 FAIL；C 规�
 前端固定 **Agent3 逐步调试及完整冷启动无头，Agent4 Formal 有头**；需在有桌面的 Windows
 会话中启动服务才能看到正式浏览器。Trial/Formal 独立 Profile、冻结源码和 Oracle 规则不变。
 没有 Headless 开关。下文 CLI 的默认全部无头和 `--show-browser` 行为保持兼容。
+“正式执行页面停留时间”可设 0～3 秒，默认 1.5 秒。控制侧在每步正式取证后（包括最后一步）
+保持浏览器打开再继续；不向生成代码插入 sleep，不改变源码哈希或操作/取证阶段超时。
+停留仍受会话总期限约束。时间敏感的网站请设置为 0。后台编写调试及完整模拟运行无延时。
 
 任务在后台线程执行，刷新可通过地址栏 `?job=<id>` 回到同一任务。单个 Streamlit 服务一次
 只接受一个活动任务；重复点击复用同一 ID。结束后点击“新建测试任务”才能再次启动。
@@ -60,9 +68,9 @@ Test-Path $env:CHROMEDRIVER_PATH
 ```
 
 Dynamic 的受控 Runtime 不自动下载 Driver，环境变量只对当前终端及其子进程有效。
-模型凭据通过控制侧环境变量或项目 `.env` 配置，例如 `DEEPSEEK_API_KEY`；
+CLI 模型凭据通过控制侧环境变量或项目 `.env` 配置，例如 `DEEPSEEK_API_KEY`；
 不写入源码、生成的 Selenium 脚本或日志。复用 `llm_adapter.py`，也支持已有
-OpenRouter/OpenAI provider 选项；验收记录注明实际使用的 provider/model。
+OpenRouter/OpenAI/SiliconFlow provider 选项；前端独立使用用户输入。验收记录注明实际使用的 provider/model。
 
 下面的依据是人工构造的演示规格，不是 Selenium 官方说明。访问需获得授权；
 页面表单只填写测试数据，不输入密码或真实个人信息。

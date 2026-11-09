@@ -42,7 +42,7 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
                  start_url: str | None = None, allow_local_research: bool = False,
                  step_attempts: int = 3, task_repairs: int = 5,
                  test_basis: str | None = None, formal_headless: bool | None = None,
-                 progress_callback=None) -> dict:
+                 progress_callback=None, formal_demo_delay: float = 0.0) -> dict:
     if test_basis is not None and not isinstance(test_basis, str):
         raise ValueError('test_basis must be plain text')
     test_basis = test_basis or ''
@@ -55,7 +55,8 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
                             output_root=output_root, llm=llm, provider=provider, model=model,
                             step_attempts=step_attempts, task_repairs=task_repairs,
                             test_basis=test_basis, only_generate=only_generate,
-                            formal_headless=formal_headless, progress_callback=progress_callback)
+                            formal_headless=formal_headless, progress_callback=progress_callback,
+                            formal_demo_delay=formal_demo_delay)
     if target == 'arxiv' and not allow_live_site:
         raise ValueError('真实 arXiv 运行需要确认网站许可与访问规则：--allow-live-site')
     if target not in {'arxiv', 'fixture', 'fixture-bug'}:
@@ -219,13 +220,15 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
 
 def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, model,
                  step_attempts, task_repairs, test_basis='', only_generate=False,
-                 formal_headless=None, progress_callback=None):
+                 formal_headless=None, progress_callback=None, formal_demo_delay=0.0):
     """Dynamic branch in the existing Pipeline; six Agents retain their roles."""
     import hashlib
     import time
     from .checked_selenium import origin, step_repair_context
     from .selenium_runtime import create_session, RuntimeLimits, ARTIFACT_ROOT
     from .schema import validate_dynamic_plan
+    from .selenium_runtime import validate_presentation_delay
+    formal_demo_delay = validate_presentation_delay(formal_demo_delay)
     if not url or not requirement.strip():
         raise ValueError('Explicit URL and natural language requirement are required')
     origin(url)
@@ -277,7 +280,9 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
             try:
                 value = self.model.complete_json(system, user)
             except Exception as exc:
+                from .llm_adapter import safe_model_error
                 event('LLM', 'call_finished', status='ERROR', error_type=type(exc).__name__,
+                      error_message=safe_model_error(exc),
                       duration_seconds=round(time.monotonic()-call_started,3))
                 raise
             event('LLM', 'call_finished', status='COMPLETE',
@@ -288,7 +293,8 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         shown_headless = headless if purpose != 'formal' or formal_headless is None else formal_headless
         event('Runtime','session_starting',purpose=purpose,reason=reason,headless=shown_headless)
         s = create_session(run_dir, purpose=purpose, start_url=url, research_mode=True,
-                           limits=limits, headless=shown_headless)
+                           limits=limits, headless=shown_headless,
+                           formal_demo_delay=formal_demo_delay if purpose == 'formal' else 0.0)
         sessions.append(s)
         s.progress_callback = lambda action, **data: event('Runtime', action, phase=reason,
                                                          purpose=purpose, **data)

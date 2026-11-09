@@ -10,6 +10,15 @@ import pytest
 from web_agent import ui_tasks as ui
 
 
+class StubLLM:
+    def __init__(self, **kwargs): self.settings = kwargs
+    def close(self): pass
+
+
+AI = dict(provider='deepseek', model='test-model')
+SECRET = 'synthetic-ui-secret'
+
+
 def wait_finished(store, key):
     deadline = time.monotonic()+3
     while time.monotonic()<deadline:
@@ -22,14 +31,15 @@ def wait_finished(store, key):
 def test_store_deduplicates_clicks_and_refresh_and_uses_phase_policy(tmp_path):
     release=threading.Event(); entered=threading.Event(); calls=[]
     def runner(**kw):
-        calls.append(kw);entered.set()
+        calls.append(kw)
         kw['progress_callback'](dict(agent='Agent1',action='started',elapsed_seconds=.1))
+        entered.set()
         assert release.wait(3)
         return dict(run_dir=str(tmp_path),report=str(tmp_path/'report.md'),verdict=dict(status='PASS'))
-    store=ui.TaskStore(tmp_path/'jobs',runner=runner)
+    store=ui.TaskStore(tmp_path/'jobs',runner=runner,llm_factory=StubLLM)
     inputs=next(iter(ui.DEMO_PRESETS.values()));key=uuid.uuid4().hex
     try:
-        assert store.start(inputs,request_id=key)==key
+        assert store.start(inputs,request_id=key,ai_config=AI,api_key=SECRET)==key
         assert entered.wait(2)
         assert store.start(inputs,request_id=key)==key
         assert store.start(inputs,request_id=uuid.uuid4().hex)==key
@@ -53,8 +63,8 @@ def test_restart_marks_active_job_interrupted_without_running(tmp_path):
 
 def test_task_exception_does_not_publish_sdk_message(tmp_path):
     def runner(**kw): raise RuntimeError('synthetic credential must not appear')
-    store=ui.TaskStore(tmp_path,runner=runner);key=uuid.uuid4().hex
-    store.start(next(iter(ui.DEMO_PRESETS.values())),request_id=key)
+    store=ui.TaskStore(tmp_path,runner=runner,llm_factory=StubLLM);key=uuid.uuid4().hex
+    store.start(next(iter(ui.DEMO_PRESETS.values())),request_id=key,ai_config=AI,api_key=SECRET)
     assert wait_finished(store,key)['error_type']=='RuntimeError'
     assert 'synthetic credential' not in (tmp_path/(key+'.json')).read_text(encoding='utf-8')
 
@@ -62,8 +72,8 @@ def test_task_exception_does_not_publish_sdk_message(tmp_path):
 def test_final_cleanup_verdict_wins_over_returned_business_verdict(tmp_path):
     (tmp_path/'final_verdict.json').write_text('{"status":"ERROR"}',encoding='utf-8')
     def runner(**kw): return dict(run_dir=str(tmp_path),verdict=dict(status='PASS'))
-    store=ui.TaskStore(tmp_path/'jobs',runner=runner);key=uuid.uuid4().hex
-    store.start(next(iter(ui.DEMO_PRESETS.values())),request_id=key)
+    store=ui.TaskStore(tmp_path/'jobs',runner=runner,llm_factory=StubLLM);key=uuid.uuid4().hex
+    store.start(next(iter(ui.DEMO_PRESETS.values())),request_id=key,ai_config=AI,api_key=SECRET)
     assert wait_finished(store,key)['result']['verdict']['status']=='ERROR'
 
 
@@ -101,7 +111,7 @@ def test_presets_match_accepted_v05_inputs():
             assert {k:preset[k] for k in original}==original
 
 
-def test_frontend_presets_are_editable_and_no_browser_switch(tmp_path,monkeypatch):
+def test_frontend_user_configuration_and_no_presets_or_browser_switch(tmp_path,monkeypatch):
     from streamlit.testing.v1 import AppTest
     import streamlit as st
     store=ui.TaskStore(tmp_path)
@@ -110,14 +120,50 @@ def test_frontend_presets_are_editable_and_no_browser_switch(tmp_path,monkeypatc
     try:
         app=AppTest.from_file(str(ui.ROOT/'app_ui.py'),default_timeout=10).run()
         assert not app.exception
-        app.selectbox(key='preset').select(list(ui.DEMO_PRESETS)[1]).run()
-        assert app.text_area(key='test_basis').value==list(ui.DEMO_PRESETS.values())[1]['test_basis']
+        assert not any(x.key=='preset' for x in app.selectbox)
+        assert app.text_area(key='test_basis').value==''
+        assert app.text_input(key='api_key').value==''
+        app.selectbox(key='ai_provider').select('siliconflow').run()
+        assert app.text_input(key='base_url').value=='https://api.siliconflow.cn/v1'
+        app.text_input(key='model').set_value('custom/model').run()
+        app.text_input(key='url').set_value(ui.FORM_URL).run()
+        app.text_input(key='api_key').set_value(SECRET).run()
         app.text_area(key='requirement').set_value('editable input').run()
         assert app.text_area(key='requirement').value=='editable input'
         assert len(app.checkbox)==1 and app.button(key='start_test').disabled
         app.checkbox[0].check().run()
         assert not app.button(key='start_test').disabled
+        assert app.slider(key='formal_demo_delay').value==1.5
     finally: st.cache_resource.clear()
+
+
+def test_frontend_passes_current_credentials_then_clears_password(tmp_path,monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    clients=[]
+    class Client(StubLLM):
+        def __init__(self, **kw): super().__init__(**kw);clients.append(self)
+    store=ui.TaskStore(tmp_path,runner=lambda **kw:dict(run_dir=str(tmp_path),verdict=dict(status='PASS',checks=[])),
+                       llm_factory=Client)
+    monkeypatch.setattr(ui,'TaskStore',lambda:store);st.cache_resource.clear()
+    try:
+        app=AppTest.from_file(str(ui.ROOT/'app_ui.py'),default_timeout=10).run()
+        app.selectbox(key='ai_provider').select('openrouter').run()
+        app.text_input(key='model').set_value('chosen/model').run()
+        app.text_input(key='api_key').set_value(SECRET).run()
+        app.text_input(key='url').set_value(ui.FORM_URL).run()
+        app.text_area(key='requirement').set_value('Check feedback').run()
+        app.checkbox(key='authorized').check().run()
+        app.button(key='start_test').click().run()
+        assert not app.exception
+        assert clients and clients[0].settings['api_key']==SECRET
+        assert clients[0].settings['provider']=='openrouter' and clients[0].settings['use_environment'] is False
+        assert 'api_key' not in app.session_state
+        assert len(store.jobs)==1
+        app.run()
+        assert len(store.jobs)==1
+        for p in tmp_path.glob('*.json'): assert SECRET not in p.read_text(encoding='utf-8')
+    finally:st.cache_resource.clear()
 
 
 @pytest.mark.parametrize('verdict',['PASS','FAIL','ERROR','INCONCLUSIVE'])
@@ -269,6 +315,9 @@ def test_running_frontend_collapses_inputs_and_shows_real_wait(tmp_path,monkeypa
         assert any('已等待' in item.value for item in app.info)
         assert any('Agent1' in item.value and '正在执行' in item.value for item in app.subheader)
         assert any(item.label=='本次测试配置 · 只读' and not item.proto.expanded for item in app.expander)
+        cards=[m.value for m in app.markdown if '<div class="stage' in m.value]
+        assert len(cards)==6 and sum('正式浏览器测试与取证' in x for x in cards)==1
+        assert not any('Agent6' in x for x in cards)
     finally:st.cache_resource.clear()
 
 
@@ -289,4 +338,166 @@ def test_history_remains_read_only_while_another_task_runs(tmp_path,monkeypatch)
         app.button(key='return_active').click().run()
         assert not app.exception and app.query_params['job']==active
         assert store.active()==active and len(store.jobs)==2
+    finally:st.cache_resource.clear()
+
+
+def rejected_plan_job(run_dir):
+    """Offline example matching two normal reviews followed by a planning stop."""
+    return dict(id=uuid.uuid4().hex,status='FINISHED',started_at=100,duration_seconds=8,
+        inputs=next(iter(ui.DEMO_PRESETS.values())),events=[
+            dict(agent='Agent2',action='started',elapsed_seconds=1),
+            dict(agent='Agent2',action='review_finished',approved=False,elapsed_seconds=2),
+            dict(agent='Agent1',action='started',elapsed_seconds=3),
+            dict(agent='Agent1',action='semantic_plan_created',elapsed_seconds=4),
+            dict(agent='Agent2',action='started',elapsed_seconds=5),
+            dict(agent='Agent2',action='review_finished',approved=False,elapsed_seconds=6),
+            dict(agent='Agent2',action='input_not_ready',elapsed_seconds=7),
+            dict(agent='Pipeline',action='run_finished',status='INCONCLUSIVE',elapsed_seconds=8)],
+        result=dict(run_dir=str(run_dir),verdict=dict(status='INCONCLUSIVE',checks=[],
+            stopped_stage='Agent2',reason_type='contract_unapproved',execution_started=False)))
+
+
+def test_unapproved_plan_result_and_history_never_claim_browser_or_formal_evidence(tmp_path,monkeypatch):
+    from copy import deepcopy
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    app_path=ui.ROOT/'app_ui.py'
+    monkeypatch.setattr(ui,'ROOT',tmp_path)
+    run=tmp_path/'artifacts'/'unapproved';run.mkdir(parents=True)
+    job=rejected_plan_job(run)
+    (run/'final_verdict.json').write_text(json.dumps(job['result']['verdict']),encoding='utf-8')
+    store=ui.TaskStore(tmp_path/'jobs',runner=lambda **kw:pytest.fail('history must not execute'))
+    other=dict(deepcopy(job),id=uuid.uuid4().hex,started_at=90)
+    store.jobs={job['id']:job,other['id']:other}
+    for value in store.jobs.values():store._save(value)
+    before={p:p.read_bytes() for p in tmp_path.rglob('*.json')}
+    original=deepcopy(job)
+    view=ui.result_view(job)
+    assert view['execution_summary']=='测试规划未通过，尚未执行浏览器。'
+    assert not view['formal_valid'] and not view['rows'] and not view['steps']
+    assert ui.progress_view(job)['stages']['Agent2']['status']=='审核未通过'
+    assert job==original
+    monkeypatch.setattr(ui,'TaskStore',lambda:store);st.cache_resource.clear()
+    try:
+        app=AppTest.from_file(str(app_path),default_timeout=10)
+        app.query_params['job']=job['id'];app.run()
+        for _ in range(2):
+            assert not app.exception
+            assert any('测试规划未通过，尚未执行浏览器。' in e.value for e in app.info)
+            assert not any('独立正式证据' in e.value or '真实模型与正式证据' in e.value for e in app.caption)
+            card=next(m.value for m in app.markdown if '<div class="stage' in m.value and 'Agent2' in m.value)
+            assert '审核未通过' in card and '异常' not in card
+            assert any('INCONCLUSIVE' in m.value for m in app.markdown)
+            assert not app.text_input and not app.text_area and not app.image
+            app.run()  # A refresh is read-only too.
+            app.selectbox(key='history_job').select(other['id']).run()
+        assert all(p.read_bytes()==data for p,data in before.items())
+        assert store.active() is None
+    finally:st.cache_resource.clear()
+
+
+@pytest.mark.parametrize('action',['review_finished','blockage_reviewed'])
+def test_normal_review_rejection_can_later_complete_without_stale_error(action):
+    job=dict(status='RUNNING',started_at=100,events=[
+        dict(agent='Agent2',action='started',elapsed_seconds=0),
+        dict(agent='Agent2',action=action,approved=False,elapsed_seconds=1)])
+    assert ui.progress_view(job,now=102)['stages']['Agent2']['status']=='审核未通过'
+    job['events'] += [dict(agent='Agent1',action='started',elapsed_seconds=2),
+        dict(agent='Agent1',action='semantic_plan_created',elapsed_seconds=3),
+        dict(agent='Agent2',action='started',elapsed_seconds=4),
+        dict(agent='Agent2',action=action,approved=True,elapsed_seconds=5)]
+    job.update(status='FINISHED',duration_seconds=6)
+    view=ui.progress_view(job)
+    assert view['stages']['Agent2']['status']=='已完成'
+    assert view['stages']['Agent2']['seconds']==2
+    assert view['calls_failed']==0
+
+
+@pytest.mark.parametrize('failure', ['llm','diagnosed','both'])
+def test_agent2_technical_errors_remain_errors_after_normal_review_history(failure):
+    job=dict(status='FINISHED',started_at=100,duration_seconds=7,events=[
+        dict(agent='Agent2',action='started',elapsed_seconds=0),
+        dict(agent='Agent2',action='review_finished',approved=False,elapsed_seconds=1),
+        dict(agent='Agent2',action='started',elapsed_seconds=2)])
+    if failure in {'llm','both'}:
+        job['events'] += [dict(agent='LLM',action='call_started',stage='Agent2',elapsed_seconds=3),
+            dict(agent='LLM',action='call_finished',status='ERROR',elapsed_seconds=4)]
+    if failure in {'diagnosed','both'}:
+        job['events'].append(dict(agent='Agent6',action='diagnosed_stop',stage='Agent2Implementation',elapsed_seconds=5))
+    view=ui.progress_view(job)
+    assert view['stages']['Agent2']['status']=='异常'
+    assert view['calls_failed']==int(failure in {'llm','both'})
+
+
+@pytest.mark.parametrize('verdict,events,message', [
+    (dict(execution_started=False,reason_type='conflict'),[], '测试输入存在冲突，尚未执行浏览器。'),
+    (dict(execution_started=False,reason_type='unclear'),[], '测试预期尚不明确，尚未执行浏览器。'),
+    (dict(execution_started=False,reason_type='planning_only'),[], '仅完成测试规划，尚未执行浏览器。'),
+    (dict(execution_started=True,reason_type='contract_unapproved'),[], '已进入浏览器执行，尚未形成可用的正式证据。'),
+    ({},[dict(agent='Runtime',action='session_created',purpose='trial')], '已进入浏览器执行，尚未形成可用的正式证据。'),
+    ({},[dict(agent='Agent4',action='started')], '已进入正式执行，正式证据尚不完整。'),
+    ({},[dict(agent='Runtime',action='session_created',purpose='formal')], '已进入正式执行，正式证据尚不完整。'),
+    ({},[], '未发现浏览器执行或正式取证记录。'),
+])
+def test_other_early_stops_describe_actual_execution_without_reclassifying_verdict(tmp_path,monkeypatch,verdict,events,message):
+    from copy import deepcopy
+    monkeypatch.setattr(ui,'ROOT',tmp_path)
+    job=rejected_plan_job(tmp_path/'artifacts'/'missing')
+    job['events']=events
+    job['result']['verdict']=dict(status='INCONCLUSIVE',checks=[],**verdict)
+    original=deepcopy(job)
+    view=ui.result_view(job)
+    assert view['execution_summary']==message
+    assert not view['formal_valid'] and not view['rows']
+    assert job==original
+
+
+def test_formal_file_without_measurements_or_screenshots_is_not_claimed_as_collected_evidence(tmp_path,monkeypatch):
+    job,run,evidence=result_fixture(tmp_path,monkeypatch)
+    evidence.update(measurements={},steps=[])
+    (run/'formal_evidence.json').write_text(json.dumps(evidence),encoding='utf-8')
+    job['result']['verdict']=dict(status='INCONCLUSIVE',checks=[])
+    view=ui.result_view(job)
+    assert view['formal_valid']
+    assert view['execution_summary']=='已进入正式执行，正式证据尚不完整。'
+    assert view['verdict']['status']=='INCONCLUSIVE'
+    assert all(not r['actual_available'] and r['screenshot'] is None for r in view['rows'])
+
+
+@pytest.mark.parametrize('status', ['PASS','FAIL'])
+def test_formal_result_keeps_comparison_screenshot_code_and_report(tmp_path,monkeypatch,status):
+    from copy import deepcopy
+    from streamlit.testing.v1 import AppTest
+    import streamlit as st
+    app_path=ui.ROOT/'app_ui.py'
+    job,run,evidence=result_fixture(tmp_path,monkeypatch)
+    contract=ui.read_json(run/'test_contract.json')
+    contract['oracles']=contract['oracles'][:2]
+    contract['oracles'][1]['expected']='Received!' if status=='PASS' else 'Accepted!'
+    (run/'test_contract.json').write_text(json.dumps(contract),encoding='utf-8')
+    verdict=job['result']['verdict']
+    verdict.update(status=status,checks=verdict['checks'][:2],skipped_steps=[])
+    verdict['checks'][1]['passed']=status=='PASS'
+    (run/'generated_test.py').write_text('# frozen test code\n',encoding='utf-8')
+    (run/'report.md').write_text('saved report',encoding='utf-8')
+    original=deepcopy(job)
+    view=ui.result_view(job)
+    assert view['formal_valid'] and view['execution_summary']=='已采集独立正式证据。'
+    assert view['focus']['actual']=='Received!' and view['focus']['expected']==contract['oracles'][1]['expected']
+    assert view['focus']['status']==status and view['focus']['screenshot']==run/'formal'/'session'/'fail.png'
+    store=ui.TaskStore(tmp_path/'jobs',runner=lambda **kw:pytest.fail('saved result must not execute'))
+    store.jobs[job['id']]=job
+    monkeypatch.setattr(ui,'TaskStore',lambda:store);st.cache_resource.clear()
+    try:
+        app=AppTest.from_file(str(app_path),default_timeout=10)
+        app.query_params['job']=job['id'];app.run()
+        assert not app.exception
+        assert any('独立正式证据' in e.value for e in app.caption)
+        assert app.selectbox(key='oracle_'+job['id']).value==view['focus']['oracle_id']
+        assert len(app.image)==1
+        assert any('frozen test code' in e.value for e in app.code)
+        assert any('saved report' in e.value for e in app.text)
+        downloads=[e.proto.label for e in app.get('download_button')]
+        assert all(label in downloads for label in ('下载当前正式截图','下载生成代码','下载报告'))
+        assert job==original
     finally:st.cache_resource.clear()

@@ -12,7 +12,7 @@ import json
 from typing import Any
 
 from ..schema import (JSONModel, QuerySpec, TestContract, ORACLE_GUIDE, ORACLE_SOURCE_GUIDE,
-                      oracle_source_issues, validate_oracle_binding, TARGET_GUIDE)
+                      oracle_source_issues, validate_oracle_binding, TARGET_GUIDE, dependency_issues)
 from ..checked_selenium import EVIDENCE_GUIDE
 
 
@@ -108,6 +108,11 @@ must NOT be required for a string-label Oracle. Review intent, not absent locato
             if source_issues:
                 data['approved'] = False
                 data['issues'].extend(source_issues)
+        structure_issues = dependency_issues(draft)
+        if structure_issues:
+            data['approved'] = False
+            data['dependency_issues'] = structure_issues
+            data['issues'].extend(structure_issues)
         if not draft.get('oracles') or not draft.get('steps') or draft.get('missing_inputs'):
             if data['input_status'] == 'consistent':
                 data['input_status'] = 'unclear'

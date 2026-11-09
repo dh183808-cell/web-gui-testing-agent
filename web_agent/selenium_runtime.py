@@ -34,6 +34,12 @@ REVIEWED_SCRIPT_SHA256 = '68da6297c3c8827b505ec53e99a9654567bc4a2720df52eb8afc89
 CHECKED_PHASES = ('pre_observe', 'script_execute', 'oracle_capture', 'post_observe')
 
 
+def validate_presentation_delay(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 3:
+        raise ValueError('正式执行页面停留时间须为 0～3 秒')
+    return float(value)
+
+
 def phase_domain(phase):
     return 'observation' if phase in {'pre_observe', 'post_observe'} else 'oracle' if phase == 'oracle_capture' else 'script'
 
@@ -174,7 +180,8 @@ class LocalSession:
     creates a private Fixture server and data store, not just a clean Profile.
     """
     def __init__(self, run_dir: Path, *, purpose='trial', seed='phase1', limits=None,
-                 headless=True, driver_path=None, chrome_binary=None, start_url=None, research_mode=False):
+                 headless=True, driver_path=None, chrome_binary=None, start_url=None, research_mode=False,
+                 formal_demo_delay=0.0):
         if purpose not in {'trial', 'development', 'formal'}:
             raise ValueError('Invalid execution purpose')
         if not isinstance(seed, str) or len(seed) > 100:
@@ -195,12 +202,15 @@ class LocalSession:
         self.limits = limits or RuntimeLimits()
         self.session_id = uuid.uuid4().hex
         self.purpose, self.seed = purpose, seed
+        delay = validate_presentation_delay(formal_demo_delay)
+        self.formal_demo_delay = delay if purpose == 'formal' else 0.0
+        self._pause_cancel = threading.Event()
         self.run_dir = root / purpose / self.session_id
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.research_mode = research_mode
         self.progress_callback = None
         self._options = dict(headless=headless, driver_path=driver_path, chrome_binary=chrome_binary,
-                             start_url=start_url, research_mode=research_mode)
+                             start_url=start_url, research_mode=research_mode, formal_demo_delay=self.formal_demo_delay)
         self._root = root
         self._responses = queue.Queue()
         self._lock = threading.RLock()
@@ -211,6 +221,7 @@ class LocalSession:
                         'profile_removed': False, 'driver_quit': False}
         self.metadata = dict(session_id=self.session_id, purpose=purpose, seed=seed,
                              headless=headless,
+                             formal_demo_delay=self.formal_demo_delay,
                              limits=asdict(self.limits), status='STARTING', execution_mode='local_trusted',
                              security_sandbox=False)
         self._exit_handler = self.close_session
@@ -401,6 +412,20 @@ class LocalSession:
             results.append(result)
             if result['status'] != 'COMPLETE':
                 break
+            # Trusted control-side pacing, AFTER evidence and outside Worker phase
+            # deadlines. Includes the final page; never changes generated source.
+            if getattr(self, 'formal_demo_delay', 0) and self.purpose == 'formal':
+                started = time.monotonic()
+                self._progress('presentation_pause_started', step_id=step['id'], seconds=self.formal_demo_delay)
+                cancelled = self._pause_cancel.wait(self.formal_demo_delay)
+                result['presentation'] = dict(requested_seconds=self.formal_demo_delay,
+                    elapsed_seconds=round(time.monotonic()-started, 3), cancelled=cancelled)
+                self._write('presentation_' + step['id'] + '.json', result['presentation'])
+                self._progress('presentation_pause_finished', step_id=step['id'],
+                    duration_seconds=result['presentation']['elapsed_seconds'], cancelled=cancelled)
+                if cancelled:
+                    result.update(status='ERROR', error_type='SessionClosedDuringPresentation')
+                    break
         return dict(execution_status='COMPLETE' if len(results) == len(steps) and all(
                         r['status']=='COMPLETE' for r in results) else 'ERROR',
                     script_sha256=hashlib.sha256(source.encode()).hexdigest(),
@@ -442,6 +467,8 @@ class LocalSession:
         self.close_session(graceful=False)
 
     def close_session(self, *, graceful=True):
+        pause_cancel = getattr(self, '_pause_cancel', None)
+        if pause_cancel: pause_cancel.set()
         with self._lock:
             if self._closed:
                 return dict(self.cleanup)

@@ -10,6 +10,7 @@ import time
 import uuid
 
 from .pipeline import ROOT, run_pipeline
+from .llm_adapter import PROVIDERS, StructuredLLM, public_config, safe_model_error
 
 
 FORM_URL = 'https://www.selenium.dev/selenium/web/web-form.html'
@@ -25,9 +26,26 @@ DEMO_PRESETS = {
         requirement='在 Text input 中输入 WebAgent Test，检查页面是否提供 Reset 按钮；如果存在则点击，并验证输入框被清空。如果按钮不存在，应依据测试说明判断该功能是否符合预期。'),
 }
 STAGES = ('Agent1', 'Agent2', 'Agent3', 'Cold', 'Agent4', 'Formal', 'Agent5', 'Agent6')
-STAGE_LABELS = dict(Agent1='Agent1 · 测试设计', Agent2='Agent2 · 契约审核',
-    Agent3='Agent3 · 编码调试', Cold='Cold Trial · 冷启动', Agent4='Agent4 · 独立执行',
-    Formal='Formal · 正式取证', Agent5='Agent5 · 证据判定', Agent6='Agent6 · 异常诊断')
+STAGE_LABELS = dict(Agent1='Agent1 · 测试方案设计', Agent2='Agent2 · 测试方案审核',
+    Agent3='Agent3 · 后台编写与调试', Cold='完整模拟运行', Agent4='Agent4 · 正式浏览器测试与取证',
+    Formal='Agent4 · 正式浏览器测试与取证', Agent5='Agent5 · 测试结果核验', Agent6='Agent6 · 异常诊断')
+PROVIDER_LABELS = dict(deepseek='DeepSeek', openai='OpenAI', openrouter='OpenRouter', siliconflow='硅基流动')
+
+
+def provider_defaults(provider):
+    """Display editable public configuration; never read API keys into UI defaults."""
+    config = PROVIDERS[provider]
+    # Whitelist public names, rather than loading .env into the process environment.
+    public = {}
+    path = ROOT / '.env'
+    if path.is_file():
+        allowed = {config['model_env'], provider.upper() + '_BASE_URL'}
+        for line in path.read_text(encoding='utf-8-sig').splitlines():
+            name, sep, value = line.partition('=')
+            if sep and name.strip() in allowed:
+                public[name.strip()] = value.strip().strip('\"\'')
+    return dict(model=public.get(config['model_env']) or config['default_model'] or 'openai/gpt-4.1-mini',
+                base_url=public.get(provider.upper() + '_BASE_URL') or config['base_url'] or 'https://api.openai.com/v1')
 
 
 def read_json(path, default=None):
@@ -62,14 +80,18 @@ def activity_text(event):
     if action == 'session_starting': return '正在启动独立的正式 Chrome' if event.get('purpose') == 'formal' else '正在启动后台 Chrome 会话'
     if action == 'session_created': return '正式浏览器已启动，正在独立重放冻结代码' if event.get('purpose') == 'formal' else '后台浏览器已就绪'
     if action == 'session_closed': return '浏览器会话已关闭并返回清理记录'
-    if action == 'started': return STAGE_LABELS.get(agent, agent) + '开始'
+    if action == 'presentation_pause_started': return f"{sid} 正式取证完成，浏览器停留展示 {event['seconds']:g} 秒"
+    if action == 'presentation_pause_finished': return f'{sid} 页面展示结束'
+    if action == 'started':
+        if agent == 'Formal': return None  # Agent4 and Formal describe one execution.
+        return STAGE_LABELS.get(agent, agent) + '开始'
     if action == 'semantic_plan_created': return f"测试规划已生成 · {event.get('steps', 0)} 个步骤"
-    if action == 'contract_frozen': return '测试契约与 Oracle 已审核冻结'
+    if action == 'contract_frozen': return '测试方案与验证预期已审核锁定'
     if action in {'review_finished', 'blockage_reviewed'}: return 'Agent2 审核通过' if event.get('approved') else 'Agent2 审核未通过，返回具体意见'
     if action == 'review_feedback': return 'Agent2 返回审核意见，按现有预算修订'
     if action == 'evidence_bindings_repaired': return f'{sid} 取证绑定已修复，冻结代码未改变'
-    if action == 'cold_trial_finished': return '完整冷启动' + ('通过' if event.get('status') == 'COMPLETE' else '未通过')
-    if action == 'same_source_replayed_independently': return 'Formal 已完成同版本代码独立重放'
+    if action == 'cold_trial_finished': return '完整模拟运行' + ('通过' if event.get('status') == 'COMPLETE' else '未通过')
+    if action == 'same_source_replayed_independently': return '正式浏览器已完成同版本代码独立执行'
     if action == 'business_verdict': return 'Agent5 已给出正式结论：' + event['status']
     if action == 'diagnosed_stop': return 'Agent6 已诊断并停止：' + (event.get('error_type') or '技术执行异常')
     if action == 'input_not_ready': return '测试依据或预期尚不明确，停止后续执行'
@@ -105,9 +127,9 @@ def progress_view(job, *, now=None):
         active = ['Agent4', 'Formal'] if name in {'Agent4', 'Formal'} else [name]
         for item in active: states[item].update(status='执行中', called=True)
 
-    def finish(name, ok=True):
+    def finish(name, ok=True, *, status=None):
         nonlocal active
-        states[name].update(status='已完成' if ok else '异常', called=True)
+        states[name].update(status=status or ('已完成' if ok else '异常'), called=True)
         active = [item for item in active if item != name]
 
     for event in job.get('events', []):
@@ -140,7 +162,11 @@ def progress_view(job, *, now=None):
         if action == 'session_created' and event.get('purpose') == 'formal': formal_session = True
         if action == 'session_closed' and formal_session and event.get('reason') == 'formal_replay_finished': formal_session = False
         if action in {'semantic_plan_created', 'contract_frozen', 'review_finished', 'blockage_reviewed', 'same_source_replayed_independently', 'business_verdict', 'diagnosed_stop'} and agent in states:
-            finish(agent, event.get('approved') is not False)
+            # A review decision is a normal outcome, not an execution exception.
+            rejected = agent == 'Agent2' and action in {'review_finished', 'blockage_reviewed'} and event.get('approved') is False
+            finish(agent, status='审核未通过' if rejected else None)
+        if action == 'input_not_ready' and states['Agent2']['called'] and states['Agent2']['status'] != '异常':
+            finish('Agent2', status='审核未通过')
         if action == 'cold_trial_finished':
             finish('Agent3', event.get('status') == 'COMPLETE')
         if agent in {'Cold', 'Formal'} and action == 'finished': finish(agent, event.get('status') == 'COMPLETE')
@@ -214,16 +240,42 @@ def result_view(job):
             path = formal_path(ref)
             steps.append(dict(step_id=step['step_id'], status=step['status'], screenshot=path,
                               current_url=step.get('current_url', '')))
+    # Presentation only: absence of Formal evidence does not mean a browser ran.
+    events = job.get('events', [])
+    formal_started = formal_valid or any(
+        e['agent'] in {'Agent4', 'Formal'} and e['action'] == 'started'
+        or e['agent'] == 'Runtime' and e.get('purpose') == 'formal'
+        and e['action'] in {'session_starting', 'session_created', 'step_started', 'step_finished'} for e in events)
+    browser_started = verdict.get('execution_started') is True or any(
+        e['agent'] == 'Runtime' and e['action'] in {'session_created', 'step_started', 'step_finished'} for e in events)
+    if formal_valid and (any(r['actual_available'] and r['evidence_status'] == 'observed' for r in rows)
+                         or any(s['screenshot'] for s in steps)):
+        execution_summary = '已采集独立正式证据。'
+    elif formal_started:
+        execution_summary = '已进入正式执行，正式证据尚不完整。'
+    elif browser_started:
+        execution_summary = '已进入浏览器执行，尚未形成可用的正式证据。'
+    elif verdict.get('execution_started') is False:
+        execution_summary = {
+            'contract_unapproved': '测试规划未通过，尚未执行浏览器。',
+            'conflict': '测试输入存在冲突，尚未执行浏览器。',
+            'unclear': '测试预期尚不明确，尚未执行浏览器。',
+            'planning_only': '仅完成测试规划，尚未执行浏览器。',
+        }.get(verdict.get('reason_type'), '尚未执行浏览器。')
+    else:
+        execution_summary = '未发现浏览器执行或正式取证记录。'
     return dict(run_dir=run, verdict=verdict, rows=rows, focus=focus, steps=steps,
-                skipped=verdict.get('skipped_steps', []), formal_valid=formal_valid)
+                skipped=verdict.get('skipped_steps', []), formal_valid=formal_valid,
+                execution_summary=execution_summary)
 
 
 class TaskStore:
     """One cache_resource store per server; disk records never auto-resume runs."""
-    def __init__(self, root=None, *, runner=run_pipeline):
+    def __init__(self, root=None, *, runner=run_pipeline, llm_factory=StructuredLLM):
         self.root = Path(root or ROOT / 'artifacts' / 'ui_jobs')
         self.root.mkdir(parents=True, exist_ok=True)
         self.runner = runner
+        self.llm_factory = llm_factory
         self.lock = threading.RLock()
         self.jobs = {}
         for path in self.root.glob('*.json'):
@@ -258,7 +310,7 @@ class TaskStore:
                       + ' · ' + (job.get('result') or {}).get('verdict', {}).get('status', job['status'])
                       + ' · ' + job['inputs']['requirement'][:18] + ' · ' + job['id'][:8]) for job in recent]
 
-    def start(self, inputs, *, request_id):
+    def start(self, inputs, *, request_id, ai_config=None, api_key='', formal_demo_delay=1.5):
         from .checked_selenium import origin
         uuid.UUID(hex=request_id)
         origin(inputs['url'])
@@ -268,11 +320,17 @@ class TaskStore:
             if request_id in self.jobs: return request_id
             active = self.active()
             if active: return active
+            if not isinstance(api_key, str) or not api_key.strip():
+                raise ValueError('请在界面填写本次任务的 API Key；不会使用后台 .env 密钥')
+            ai_config = public_config(**(ai_config or {}))
+            from .selenium_runtime import validate_presentation_delay
+            formal_demo_delay = validate_presentation_delay(formal_demo_delay)
             job = dict(id=request_id, inputs=inputs, status='RUNNING', started_at=time.time(),
-                       started_utc=datetime.now(timezone.utc).isoformat(), events=[], result=None)
+                       started_utc=datetime.now(timezone.utc).isoformat(), events=[], result=None,
+                       ai_config=ai_config, formal_demo_delay=formal_demo_delay)
             self.jobs[request_id] = job
             self._save(job)
-            thread = threading.Thread(target=self._run, args=(request_id,), daemon=True,
+            thread = threading.Thread(target=self._run, args=(request_id, api_key.strip()), daemon=True,
                                       name='webagent-ui-' + request_id[:8])
             try:
                 thread.start()
@@ -282,26 +340,35 @@ class TaskStore:
                 raise
             return request_id
 
-    def _run(self, job_id):
+    def _run(self, job_id, api_key):
         def progress(record):
             with self.lock:
                 job['events'].append(record)
                 if record['action'] == 'run_started': job['run_dir'] = record['run_dir']
                 self._save(job)
         job = self.jobs[job_id]
+        llm = None
         try:
-            result = self.runner(target='dynamic', mode='llm', provider='deepseek',
+            llm = self.llm_factory(**job['ai_config'], api_key=api_key, use_environment=False)
+            api_key = None
+            result = self.runner(target='dynamic', mode='llm', llm=llm,
+                provider=job['ai_config']['provider'], model=job['ai_config']['model'],
                 start_url=job['inputs']['url'], requirement=job['inputs']['requirement'],
                 test_basis=job['inputs']['test_basis'], allow_live_site=True, allow_local_research=True,
-                headless=True, formal_headless=False, progress_callback=progress)
+                headless=True, formal_headless=False, formal_demo_delay=job['formal_demo_delay'],
+                progress_callback=progress)
             # Cleanup may update the verdict in finally; disk is authoritative.
             verdict = read_json(Path(result['run_dir'])/'final_verdict.json', result['verdict'])
             with self.lock:
                 job.update(result=dict(result, verdict=verdict), run_dir=result['run_dir'], status='FINISHED')
         except Exception as exc:
             # SDK exceptions can include request bodies; retain only their class.
-            with self.lock: job.update(status='ERROR', error_type=type(exc).__name__)
+            with self.lock: job.update(status='ERROR', error_type=type(exc).__name__, error_message=safe_model_error(exc))
         finally:
+            api_key = None
+            if llm:
+                try: llm.close()
+                except Exception: pass
             with self.lock:
                 job['duration_seconds'] = round(time.time()-job['started_at'], 3)
                 self._save(job)

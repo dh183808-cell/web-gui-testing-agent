@@ -22,7 +22,7 @@ def main() -> int:
     parser.add_argument('--step-attempts', type=int, default=3)
     parser.add_argument('--task-repairs', type=int, default=5)
     parser.add_argument("--mode", choices=["template", "llm"], default="template")
-    parser.add_argument("--provider", choices=["deepseek", "openrouter", "openai"], default=None,
+    parser.add_argument("--provider", choices=["deepseek", "openrouter", "openai", "siliconflow"], default=None,
                         help="LLM provider when --mode llm; default from LLM_PROVIDER or deepseek")
     parser.add_argument("--model", default=None,
                         help="override provider model (OpenRouter: provider/model slug)")

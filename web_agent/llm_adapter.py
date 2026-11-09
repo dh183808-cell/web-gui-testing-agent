@@ -1,8 +1,9 @@
 """Provider-aware JSON LLM adapter for Agents 1/2/3.
 
-Supports DeepSeek, OpenRouter, and OpenAI via their OpenAI-compatible
+Supports DeepSeek, OpenRouter, OpenAI and SiliconFlow via OpenAI-compatible
 chat completions endpoints. Template mode never instantiates this class.
-API credentials are read from environment/.env and never written to artifacts.
+CLI credentials come from environment/.env; UI explicitly disables that fallback.
+Credentials never belong to artifacts or browser Workers.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 PROVIDERS = {
@@ -31,7 +33,40 @@ PROVIDERS = {
         "default_model": "gpt-4.1-mini",
         "base_url": None,
     },
+    "siliconflow": {
+        "key_env": "SILICONFLOW_API_KEY", "model_env": "SILICONFLOW_MODEL",
+        "default_model": "Qwen/Qwen2.5-7B-Instruct",
+        "base_url": "https://api.siliconflow.cn/v1",
+    },
 }
+
+
+def public_config(provider=None, model=None, base_url='', json_mode='auto'):
+    """Validate only non-secret UI settings. Never resolve credentials here."""
+    if provider not in PROVIDERS:
+        raise ValueError('请选择支持的 AI 服务商')
+    if not isinstance(model, str) or not model.strip() or len(model) > 160:
+        raise ValueError('请填写有效的模型 ID')
+    if json_mode not in {'auto', 'on', 'off'}:
+        raise ValueError('JSON 模式只能为 auto / on / off')
+    base_url = (base_url or '').strip()
+    if base_url:
+        parts = urlsplit(base_url)
+        if parts.scheme not in {'http', 'https'} or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
+            raise ValueError('API Base URL 须为不含凭据、查询参数的 HTTP(S) 接口地址')
+    return dict(provider=provider, model=model.strip(), base_url=base_url, json_mode=json_mode)
+
+
+def safe_model_error(exc):
+    """SDK bodies/URLs can contain secrets; expose only classified diagnostics."""
+    code = getattr(exc, 'status_code', None)
+    if code in {401, 403}: return '模型服务拒绝认证或授权，请检查 API Key 与账户权限。'
+    if code == 404: return '模型或接口地址不存在，请检查模型 ID 和 API Base URL。'
+    if code in {400, 422}: return '模型拒绝请求，请检查模型 ID、JSON 模式及接口兼容性。'
+    if code == 429: return '模型服务限流或余额不足，请检查账户后再运行。'
+    if 'Timeout' in type(exc).__name__: return '模型请求超时，请检查服务连接。'
+    if 'Connection' in type(exc).__name__: return '无法连接模型服务，请检查接口地址和网络。'
+    return '模型连接或输出校验失败，请检查配置及 JSON 兼容性（' + type(exc).__name__ + '）。'
 
 
 def _load_project_dotenv() -> None:
@@ -51,13 +86,17 @@ class StructuredLLM:
     unless LLM_JSON_MODE=on. DeepSeek/OpenAI use JSON Object mode by default.
     """
 
-    def __init__(self, *, provider: str | None = None, model: str | None = None) -> None:
-        _load_project_dotenv()
-        name = (provider or os.getenv("LLM_PROVIDER") or "deepseek").strip().lower()
+    def __init__(self, *, provider: str | None = None, model: str | None = None,
+                 api_key: str | None = None, base_url: str | None = None,
+                 json_mode: str | None = None, use_environment: bool = True) -> None:
+        if use_environment:
+            _load_project_dotenv()
+        env = os.getenv if use_environment else lambda name, default=None: default
+        name = (provider or env("LLM_PROVIDER") or "deepseek").strip().lower()
         if name not in PROVIDERS:
-            raise ValueError("未知 LLM_PROVIDER：%s；可选 deepseek / openrouter / openai" % name)
+            raise ValueError("未知 LLM_PROVIDER：%s；可选 deepseek / openrouter / openai / siliconflow" % name)
         config = PROVIDERS[name]
-        api_key = os.getenv(config["key_env"], "").strip()
+        api_key = (api_key if api_key is not None else env(config["key_env"], "")).strip()
         if not api_key:
             raise ValueError(
                 f"{name} 模式需要 {config['key_env']}；请在 .env 或当前终端设置，"
@@ -66,8 +105,8 @@ class StructuredLLM:
 
         chosen_model = (
             (model or "").strip()
-            or os.getenv(config["model_env"], "").strip()
-            or os.getenv("LLM_MODEL", "").strip()
+            or env(config["model_env"], "").strip()
+            or env("LLM_MODEL", "").strip()
             or config["default_model"]
         )
         if not chosen_model:
@@ -78,20 +117,24 @@ class StructuredLLM:
         self.provider = name
         self.model = chosen_model
 
-        json_mode = os.getenv("LLM_JSON_MODE", "auto").strip().lower()
+        json_mode = (json_mode or env("LLM_JSON_MODE", "auto")).strip().lower()
         if json_mode not in {"auto", "on", "off"}:
             raise ValueError("LLM_JSON_MODE 只能为 auto / on / off")
-        self.json_mode = (name != "openrouter") if json_mode == "auto" else (json_mode == "on")
+        self.json_mode = (name not in {"openrouter", "siliconflow"}) if json_mode == "auto" else (json_mode == "on")
 
         from openai import OpenAI
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60, "max_retries": 1}
-        base_url = config["base_url"]
-        if name == "openai":
+        chosen_base = config["base_url"]
+        if name == "openai" and use_environment:
             # The original v0.2 supported user-defined OpenAI-compatible gateways.
-            base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
-        if base_url:
-            kwargs["base_url"] = base_url
-        if name == "openrouter":
+            chosen_base = env("OPENAI_BASE_URL", "").strip() or None
+        chosen_base = base_url or chosen_base
+        if not use_environment and not chosen_base:
+            chosen_base = 'https://api.openai.com/v1'
+        public_config(name, chosen_model, chosen_base, json_mode)
+        if chosen_base:
+            kwargs["base_url"] = chosen_base
+        if name == "openrouter" and use_environment:
             headers = {}
             if os.getenv("OPENROUTER_APP_URL", "").strip():
                 headers["HTTP-Referer"] = os.environ["OPENROUTER_APP_URL"].strip()
@@ -101,6 +144,10 @@ class StructuredLLM:
                 kwargs["default_headers"] = headers
         self._client = OpenAI(**kwargs)
         self.calls = []
+
+    def close(self):
+        close = getattr(self._client, 'close', None)
+        if close: close()
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         # Every existing Agent prompt requires JSON; restating the constraint

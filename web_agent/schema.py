@@ -99,6 +99,12 @@ NOT a selector. Put this
 read-only presence check in a SEPARATE step BEFORE attempting the required action.
 Subsequent dependent steps declare depends_on=["S2"] referencing earlier STEP IDs,
 never Oracle IDs. Keep the presence-check step separate from clicking the target.
+Declare the FULL dependency chain, including checks of outcomes after the action.
+This linear runner stops a blocked branch: every later step after a required-target
+check must transitively depend on it. If the user requests independent branches,
+report this execution limitation as a missing input/uncertainty; never invent a
+dependency that changes the user's intended behavior. Do not leave outcome checks
+independent of the action they are checking.
 Use target ONLY on equals/expected=true EXISTENCE Oracles. A value/text/empty-field
 Oracle must OMIT target entirely and use an ordinary Agent3 evidence binding later.
 Never infer missing functionality from a failed locator or a truncated DOM summary.
@@ -113,6 +119,32 @@ def validate_target(target):
             or target.get('role') not in {'button','link','textbox','checkbox','radio','combobox'}
             or not isinstance(target.get('name'), str) or not 1 <= len(target['name'].strip()) <= 120):
         raise ValueError('target requires a supported semantic role and an exact nonempty name (<=120 chars)')
+
+
+def dependency_issues(plan):
+    """Check the blocked-suffix invariant already required by the linear executor.
+
+    No semantic dependencies are silently added. Independent branch plans need
+    designer clarification instead of repeatedly repairing Selenium code.
+    """
+    steps = plan.get('steps', [])
+    issues = []
+    for oracle in plan.get('oracles', []):
+        if not oracle.get('target'): continue
+        sid = oracle.get('step_id')
+        index = next((i for i, s in enumerate(steps) if s.get('id') == sid), None)
+        if index is None: continue
+        dependent, missing = {sid}, []
+        for step in steps[index+1:]:
+            if dependent.intersection(step.get('depends_on', [])):
+                dependent.add(step['id'])
+            else: missing.append(step['id'])
+        if missing:
+            issues.append(f'步骤依赖不完整：{oracle["id"]}/{sid} 检查必要目标 '
+                f'{oracle["target"]["name"]!r}，但后续 {", ".join(missing)} 未通过 depends_on '
+                '关联该前置条件。请核对操作和结果检查的真实依赖；当前线性执行器无法在阻塞后继续独立分支。'
+                '不得修改需求或预期，也不要将此结构问题交给 Agent3 修复定位器。')
+    return issues
 
 
 def validate_oracle_binding(oracle, binding):
@@ -178,6 +210,10 @@ def validate_dynamic_plan(plan, *, allow_incomplete=False, check_sources=True):
             raise ValueError(f'Oracle {oracle["id"]}: source_quote must quote the original requirement exactly')
         oracle_ids.add(oracle['id'])
     # Old stored contracts remain readable. Every newly designed contract opts in.
+    if plan.get('provenance_version') == 1:
+        issues = dependency_issues(plan)
+        if issues:
+            raise ValueError('; '.join(issues))
     if check_sources and plan.get('provenance_version') == 1:
         issues = oracle_source_issues(plan)
         if issues:

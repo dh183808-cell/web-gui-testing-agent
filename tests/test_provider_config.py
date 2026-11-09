@@ -125,3 +125,44 @@ def test_truncated_response_is_rejected(monkeypatch, fake_openai):
     fake_openai[0].completions.finish_reason = "length"
     with pytest.raises(ValueError, match="截断"):
         llm.complete_json("JSON", "test")
+
+
+@pytest.mark.parametrize('provider', llm_adapter.PROVIDERS)
+def test_explicit_ui_client_ignores_all_developer_defaults(monkeypatch, fake_openai, provider):
+    monkeypatch.setattr(llm_adapter, '_load_project_dotenv', lambda: pytest.fail('UI must not load dotenv'))
+    monkeypatch.setenv('LLM_MODEL', 'wrong-model')
+    monkeypatch.setenv('LLM_JSON_MODE', 'on')
+    monkeypatch.setenv('OPENAI_BASE_URL', 'https://wrong.test')
+    monkeypatch.setenv('OPENROUTER_APP_NAME', 'private attribution')
+    llm = llm_adapter.StructuredLLM(provider=provider, model='chosen/model', api_key='synthetic-user',
+                                    use_environment=False)
+    sdk = fake_openai[0]
+    assert sdk.connection_settings['api_key'] == 'synthetic-user'
+    assert sdk.connection_settings['base_url'] == (llm_adapter.PROVIDERS[provider]['base_url'] or 'https://api.openai.com/v1')
+    assert 'default_headers' not in sdk.connection_settings
+    llm.complete_json('JSON', 'test')
+    call = sdk.completions.calls[0]
+    assert call['model'] == 'chosen/model'
+    assert ('response_format' in call) == (provider in {'deepseek','openai'})
+    assert 'synthetic-user' not in str(llm.calls)
+
+
+def test_ui_empty_secret_never_uses_environment(monkeypatch, fake_openai):
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'synthetic-developer')
+    for secret in ('', None):
+        with pytest.raises(ValueError, match='DEEPSEEK_API_KEY'):
+            llm_adapter.StructuredLLM(api_key=secret, use_environment=False)
+
+
+@pytest.mark.parametrize('base', ['https://key@example.test/v1', 'https://example.test?key=secret', 'file:///tmp/model'])
+def test_credential_urls_are_not_public_config(base):
+    with pytest.raises(ValueError, match='Base URL'):
+        llm_adapter.public_config('openai','custom',base)
+
+
+def test_sdk_errors_have_clear_safe_diagnostics():
+    error = RuntimeError('synthetic-secret in raw SDK body')
+    for code, expected in [(401,'Key'),(404,'模型'),(400,'JSON'),(429,'限流')]:
+        error.status_code = code
+        text = llm_adapter.safe_model_error(error)
+        assert expected in text and 'synthetic-secret' not in text
