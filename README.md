@@ -1,191 +1,195 @@
-# WebAgent v0.6
+# WebAgent：多智能体 Web GUI 自动化测试框架
 
-用六个逻辑 Agent 完成自然语言驱动的 Web GUI 功能测试。当前开发入口是
-`run_demo.py --target dynamic`：真实模型规划、实时 DOM 编码与有限调试、完整冷启动、
-独立 Chrome 正式重放和基于证据的判定。Selenium 保持为唯一浏览器自动化工具。
+用户提供目标 URL、测试依据和测试需求，WebAgent 通过六个逻辑 Agent 规划、审核、生成并执行 Selenium 测试，再依据冻结预期与独立正式证据给出结论。测试目标是验证网页行为是否符合规格，产物包括可检查的 Python 代码、契约、截图、DOM 观察和判定解释。
 
-`app_ui.py` 是 Dynamic 单页面操作台，复用同一个六 Agent Pipeline。
-v0.3 的 Fixture/固定 arXiv 模板入口仍供旧 CLI 和回归测试使用。
+主要入口是 Streamlit 操作台 [app_ui.py](app_ui.py)，也可使用 [run_demo.py](run_demo.py) 的 Dynamic CLI。两者复用同一条 Pipeline。
 
-## 可视化操作台
+## 核心能力
 
-在下文配置好 ChromeDriver、Chrome 后启动：
+- 理解自然语言需求，将测试依据与本次操作目标分别保存。
+- 追踪 Oracle（预期结果）的原文来源，审核步骤、依赖和证据要求后冻结契约。
+- 根据当前 DOM 动态生成 Selenium Python，逐步试运行并有限修复技术问题。
+- 完整冷启动重跑后冻结源码，以哈希校验交付独立 Chrome 正式执行。
+- 采集与步骤、Oracle 关联的正式 DOM、截图、实际值、异常和清理记录。
+- 支持日期语义比较，以及格式不明时的可信日历选中态关联取证。
+- 输出 PASS、FAIL、ERROR、INCONCLUSIVE，区分业务不符合、技术故障和证据不足。
+- 在 Web 操作台查看实时进度、模型调用、正式证据、冻结代码和报告。
+
+当前输入为纯文本，未接入 Word/PDF 文档解析。
+
+## 六智能体架构
+
+六个角色是同一 Python 项目中的模块，不是六个独立模型进程，也并非每个角色都调用 LLM。
+
+| 角色 | 职责 |
+| --- | --- |
+| Planner / Agent1 | 从原始输入设计步骤和有来源的预期，不编写页面定位器 |
+| Reviewer / Agent2 | 审核测试语义、冻结契约，并审核执行实现 |
+| Generator / Agent3 | 观察页面，动态编写、试跑和有限修复 Selenium 代码，完成冷启动 |
+| Executor / Agent4 | 在独立会话重放同一冻结源码，采集正式证据 |
+| Validator / Agent5 | 根据冻结 Oracle 确定性核验正式证据，给出四态结果 |
+| Diagnoser / Agent6 | 在技术故障或预算耗尽时按需诊断，给出停止和排查建议 |
+
+```mermaid
+flowchart LR
+    Input[URL + 测试依据 + 测试需求] --> Planner
+    Planner --> Reviewer
+    Reviewer --> Generator
+    Generator --> Cold[完整冷启动与源码冻结]
+    Cold --> Executor
+    Executor --> Validator
+    Generator -->|技术阻塞| Diagnoser
+    Executor -->|技术异常| Diagnoser
+```
+
+Pipeline 负责阶段、权限、预算和终止。默认每步最多 3 次尝试、每任务最多 5 次技术修复；业务 FAIL 不应触发“修改到符合预期”的重试。必要控件缺失需独立正式确认，依赖操作标记未执行。
+
+## 核心技术机制
+
+**规格与契约冻结。** 测试依据描述参考规格，测试需求描述本次目标；Oracle 保留来源条款及位置。代码定位方式可以修订，指定操作和预期不能由 Generator 随意改变。未提供测试依据时，结论只针对需求本身。
+
+**动态生成与受限执行。** 模型代码以受限 Python/Selenium 子集解释执行，限制语法、操作、同源访问、时间和修复次数。页面内容作为不可信数据，模型不能使用任意 Shell、文件读取或 JavaScript 执行。该机制不等于操作系统安全沙箱。
+
+**调试与正式运行隔离。** 逐步调试成功后必须从初始状态完整重跑，再交 Agent4 使用相同源码和契约哈希独立执行。Trial 和 Formal 使用不同浏览器会话与 Profile；开发截图不能替代正式证据。
+
+**可信证据核验。** Agent5 比较冻结预期和正式测量值，保留原值、证据引用及解释。普通 `equals` 严格比较类型和值，不把近似反馈当作相等。
+
+**日期语义。** `date_equals` 将有明确来源的中文或 ISO 日期规范化，不擅自规定页面显示格式。字段有明确格式时优先使用；格式未知时，可由同次正式采集的唯一关联日历、年月标题和真实选中格消除歧义。支持有限的 ARIA 关联网格及经实例身份和日期状态交叉验证的 datepicker 结构。仅截图、`today`/`active` 类名、多候选或冲突不足以判 PASS。必要的弹窗重开操作须写入冻结代码并完成冷启动。
+
+| 结果 | 含义 |
+| --- | --- |
+| PASS | 必要正式证据满足冻结预期 |
+| FAIL | 可靠正式证据证明不符合冻结预期 |
+| ERROR | 模型服务、代码、浏览器或执行环境等技术问题导致测试不能正常完成 |
+| INCONCLUSIVE | 输入、预期或必要证据不足，无法可靠判定 |
+
+## 环境与安装
+
+主要验证环境为 Windows、Python 3.12、Chrome 和与其版本匹配的 ChromeDriver。项目不需要 Docker。依赖见 [requirements.txt](requirements.txt)；以下命令在项目根目录的 PowerShell 执行：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+预先安装 Chrome 与 ChromeDriver，填写本机实际路径：
+
+```powershell
+$env:CHROMEDRIVER_PATH = 'C:\tools\chromedriver.exe'
+$env:CHROME_BINARY = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+Test-Path $env:CHROMEDRIVER_PATH
+Test-Path $env:CHROME_BINARY
+```
+
+两项检查应返回 `True`。Dynamic Runtime 要求预先提供 Driver，不自动下载；环境变量对当前终端和子进程生效。展示正式 Chrome 时需有可交互的桌面会话。
+
+## Web 操作台
 
 ```powershell
 .\.venv\Scripts\python.exe -m streamlit run app_ui.py --server.address 127.0.0.1
 ```
 
-打开终端显示的本地地址（默认 `http://127.0.0.1:8501`）。选择 DeepSeek、OpenAI、
-OpenRouter 或硅基流动，填写可编辑的模型 ID 和本次 API Key，再填写目标 URL、
-可选测试依据和测试需求，确认授权后点击“开始测试”。高级设置可修改 API Base URL、
-JSON 输出模式，也可单独发送一次小型请求测试连接。连接成功不等于完整 Pipeline 验收成功。
-模型 ID/接口地址可从 `.env` 同名公开字段读取；Key 不预填、不回退后台 Key，不写入任务、
-证据、日志或生成代码。只在控制侧内存调用模型，启动后清除页面密码框；查看历史无需 Key。
-`.env.example` 包含四个服务商的 CLI 配置示例。A/B/C 原始输入仍保留在开发材料和回归测试，
-正常操作界面不再提供 Demo 下拉框。
+打开终端显示的本机地址，通常为 `http://127.0.0.1:8501`：
 
-界面每秒更新真实事件、六 Agent/冷启动/Formal 状态、当前步骤、耗时、模型调用和失败修复次数。
-结果包含 Oracle 来源与正式实际值、正式截图、冻结源码和可下载报告。Agent6 只在需要时调用，
-不会为了展示进度强制运行。事件计数是适配器调用次数，不包含 SDK 内部网络重试。
+1. 选择 AI 服务商，填写可编辑的模型 ID 和本次 API Key。
+2. 输入授权测试的目标 URL、可选测试依据和测试需求。
+3. 设置正式页面停留时间（0～3 秒，默认 1.5 秒）。
+4. 确认站点测试与独立重跑授权，使用可安全重复的测试数据，然后开始。
+5. 查看阶段进度、冷启动、独立 Formal、Oracle 对比、正式截图及最终结果。
 
-启动后输入配置折叠为只读，首屏展示六张阶段卡片、中文活动和模型本次等待时长。
-Agent4 与正式执行合并展示；异常诊断仅在实际调用时显示。
-结果页优先展示失败 Oracle，或关键成功证据：并列对照来源条款、冻结预期和 Formal 实际值。
-每次只展示选定 Oracle/步骤的一张正式截图；未执行的依赖步骤单列，不计作已验证失败。
-代码、报告、JSON 和原始事件可在次级展开区查看与下载。
+支持 DeepSeek、OpenAI、OpenRouter、硅基流动的配置入口；**真实账户完整验收范围为 DeepSeek**，其余三家目前只有离线配置和路由验证。模型 ID、接口和 JSON 支持以实际账户为准。高级设置提供 Base URL、JSON 模式及手动连接测试；连接测试也会调用模型，不代表完整链路验收成功。
 
-前端固定 **Agent3 逐步调试及完整冷启动无头，Agent4 Formal 有头**；需在有桌面的 Windows
-会话中启动服务才能看到正式浏览器。Trial/Formal 独立 Profile、冻结源码和 Oracle 规则不变。
-没有 Headless 开关。下文 CLI 的默认全部无头和 `--show-browser` 行为保持兼容。
-“正式执行页面停留时间”可设 0～3 秒，默认 1.5 秒。控制侧在每步正式取证后（包括最后一步）
-保持浏览器打开再继续；不向生成代码插入 sleep，不改变源码哈希或操作/取证阶段超时。
-停留仍受会话总期限约束。时间敏感的网站请设置为 0。后台编写调试及完整模拟运行无延时。
+前端要求使用者自行输入 Key，不预填或回退后台 Key；启动后清除密码框，Key 不作为任务或证据字段落盘。公开模型设置可从本地 `.env` 读取。CLI 的环境配置独立于此规则。
 
-任务在后台线程执行，刷新可通过地址栏 `?job=<id>` 回到同一任务。单个 Streamlit 服务一次
-只接受一个活动任务；重复点击复用同一 ID。结束后点击“新建测试任务”才能再次启动。
-`artifacts/ui_jobs/` 保存任务事件及状态；服务重启只恢复记录并标记中断，不自动重跑或调用 API。
-左侧“最近任务”可只读查看最近 20 项保存记录；切换历史不调用模型或启动被测浏览器。
-执行中可查看历史并返回活动任务，此时不能新开任务。
-当前没有取消按钮、跨服务器任务调度或远程多用户权限控制；请仅绑定本机访问。
+操作台固定后台调试和冷启动无头，Formal 使用独立可见 Chrome。停留发生在每步正式取证之后，不插入生成代码；时间敏感页面可设为 0。单个服务一次接受一个活动任务，支持刷新恢复和只读历史查看；服务重启不会自动重跑。请绑定本机使用，当前没有远程多用户权限管理或任务取消界面。
 
-## 本地运行
+## CLI 使用
 
-项目使用本地 Windows Python、Selenium、Chrome 和 ChromeDriver，不依赖 Docker。
-安装项目依赖后，使用项目虚拟环境运行：
+查看当前参数：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe run_demo.py --help
 ```
 
-在当前 PowerShell 配置已安装且与 Chrome 匹配的 Driver；路径是示例，需按本机修改：
+CLI 从控制侧环境变量或本地 `.env` 读取模型配置，字段示例见 [.env.example](.env.example)。按所选服务商配置，例如在当前 PowerShell 中输入临时 DeepSeek Key：
 
 ```powershell
-$env:CHROMEDRIVER_PATH = 'C:\path\to\chromedriver.exe'
-$env:CHROME_BINARY = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-Test-Path $env:CHROMEDRIVER_PATH
+$temporaryKey = Read-Host 'DeepSeek API Key' -AsSecureString
+$env:DEEPSEEK_API_KEY = [System.Net.NetworkCredential]::new('', $temporaryKey).Password
 ```
 
-Dynamic 的受控 Runtime 不自动下载 Driver，环境变量只对当前终端及其子进程有效。
-CLI 模型凭据通过控制侧环境变量或项目 `.env` 配置，例如 `DEEPSEEK_API_KEY`；
-不写入源码、生成的 Selenium 脚本或日志。复用 `llm_adapter.py`，也支持已有
-OpenRouter/OpenAI/SiliconFlow provider 选项；前端独立使用用户输入。验收记录注明实际使用的 provider/model。
-
-下面的依据是人工构造的演示规格，不是 Selenium 官方说明。访问需获得授权；
-页面表单只填写测试数据，不输入密码或真实个人信息。
+以下提交反馈示例需使用者确认可以低频、重复执行。测试依据是人工构造的规格，不是网站官方承诺：
 
 ```powershell
 $basis = '在 Web form 页面填写 Text input 并点击 Submit 后，结果页面应显示 Received!。'
 $requirement = '在 Text input 输入 WebAgent Test，点击 Submit，验证提交后的页面反馈符合测试依据。'
-.\.venv\Scripts\python.exe run_demo.py --target dynamic --mode llm --provider deepseek --url 'https://www.selenium.dev/selenium/web/web-form.html' --allow-live-site --allow-local-research --test-basis $basis --requirement $requirement
+.\.venv\Scripts\python.exe run_demo.py --target dynamic --mode llm --provider deepseek --model deepseek-flash --url 'https://www.selenium.dev/selenium/web/web-form.html' --allow-live-site --allow-local-research --test-basis $basis --requirement $requirement
+Remove-Item Env:DEEPSEEK_API_KEY
+Remove-Variable temporaryKey
 ```
 
-默认无头 Chrome；添加 `--show-browser` 才显示窗口。`--test-basis` 是可选的纯文本测试依据，
-`--requirement` 是本次测试需求。两者独立保存，不解析 Word/PDF。只根据需求测试时，
-结论不代表说明书符合性。`--only-generate` 只规划、审核契约，仍调用模型，不启动浏览器。
+默认全部无头，`--show-browser` 显示执行浏览器；这与前端固定的后台/正式分阶段模式不同。`--only-generate` 仅进行规划和审核，仍调用模型，不启动被测浏览器。`--allow-local-research` 是对本地受限执行的显式授权，不表示开启了系统沙箱。
 
-## 六 Agent 与数据流
+完整运行的 PASS 返回退出码 0，FAIL / ERROR / INCONCLUSIVE 返回 1；入口异常返回 2。仅规划正常返回 0。应结合最终判定文件解释退出码。
 
-```mermaid
-flowchart LR
-    Input[测试依据 + 测试需求] --> A1[Agent1 设计步骤与预期]
-    A1 --> A2[Agent2 审核来源并冻结契约]
-    A2 --> A3[Agent3 DOM 编码和有限修复]
-    A3 --> Cold[冷启动试运行]
-    Cold --> A4[Agent4 独立 Formal 重放同版本]
-    A4 --> A5[Agent5 正式证据判定]
-    A3 -->|技术失败或预算耗尽| A6[Agent6 诊断]
-    A4 -->|技术异常| A6
-```
+`fixture`、`fixture-bug`、`arxiv` 仍保留为固定模板兼容入口及回归用途；自然语言动态任务应显式选择 `--target dynamic --mode llm`。
 
-Pipeline 管阶段、权限、预算和终止；Agent 不自行调用其他 Agent。默认失败步骤最多
-3 次尝试、任务最多 5 次失败修复，保持已有时间预算。正确操作后的业务值不匹配不应
-触发“修到符合预期”。必要目标缺失可由 Agent2 审核候选阻塞，再冷启动并由 Agent4
-独立确认；依赖步骤标记为 `NOT_EXECUTED`，不能用 Trial 证据直接判 FAIL。
+## 测试与已验收范围
 
-| 结果 | 含义 |
-| --- | --- |
-| PASS | 必要正式证据符合冻结预期 |
-| FAIL | 可靠正式证据证明不符合冻结预期 |
-| ERROR | 代码、浏览器或 Runtime 等技术异常 |
-| INCONCLUSIVE | 输入/预期不明确或证据不足，不能可靠判定 |
-
-CLI 对 PASS 或仅规划正常返回 0；FAIL、ERROR、INCONCLUSIVE 的完整运行返回 1。
-非零退出码本身不能证明 Selenium 执行异常，应读取 `final_verdict.json`。
-
-日期目标使用 `date_equals`，例如来源“选择日期为2026年11月10日”对应
-`expected="2026-11-10"`。可信逻辑会校验真实日历、唯一日期及原文引用位置；
-这不代表用户要求页面采用 ISO 显示格式。明确的显示字符串要求需另用 `equals`。
-正式读取日期输入框 `attribute(value)` 时，会同时采集同一 DOM 节点的类型和
-`data-date-format` / `data-format` / `placeholder`。原生日期控件的 DOM value 按 ISO
-解释；斜杠日期优先使用明确的 `MM/DD/YYYY` 或 `DD/MM/YYYY` 格式依据。格式未知时，
-同次读取还会尝试采集与输入框唯一关联的正式日历选中态：支持 `aria-controls` 指向
-`aria-selected` 网格，以及输入框/弹窗/日期状态相互一致的受限 datepicker 实例结构。
-日历年月日须与输入原始值的一种有效解释一致，且来自同一 Formal 会话、步骤和取证。
-多候选、仅截图、仅 today/active 类名或证据冲突均不能据此 PASS；普通文本比较规则不变。
-弹窗关闭时需要由 Agent3 将安全的重新打开操作写入冻结脚本并完成冷启动；正式执行器
-不会临时补操作。旧运行缺少关联元数据时，不能事后改判为 PASS。
-目前不支持相对日期、无年份日期、时区时间，以及所有第三方/浏览器原生日历弹窗的自动操作。
-
-## 模块职责
-
-| 模块 | 用途 |
-| --- | --- |
-| `web_agent/agents/` | 六角色，保留 Dynamic 方法和仍使用的旧模板方法 |
-| `pipeline.py`、`schema.py` | 单一编排入口；步骤、Oracle 来源、类型、依赖及交付契约 |
-| `selenium_runtime.py`、`local_worker.py` | 会话管理、独立 Profile/运行目录、分阶段超时、进程树清理；Worker 独占 WebDriver |
-| `checked_selenium.py`、`rendered_text.js` | 受限 Selenium 解释与统一取证，完整正文读取、去重、必要目标清点 |
-| `dom_inspector.py` | 观察已有 driver，批量 DOM 提取、压缩和脱敏；不创建浏览器 |
-| `llm_adapter.py` | 控制侧模型配置和 API 调用 |
-| `ui_tasks.py`、`app_ui.py` | 后台任务防重/刷新恢复、只读进度快照与单页操作台；执行仍委托原 Pipeline |
-| `fixture_server.py` | 本地合成页面与可独立重置的服务端数据，供回归与基础设施验收 |
-| `evidence_plan.py`、`probe_plan.py`、`probe.py`、`probe_runner.py` | 旧模板的检查点取证和受限详情补证；非 Dynamic 业务路径 |
-| `report.py` | 旧模板 HTML 报告；Dynamic 当前保存 JSON 与 `report.md` |
-
-Agent3 的正式导入位置是 `web_agent.agents.generator`。已移除仅重导出的
-`web_agent.generator`；旧的 `Agent2.approve()` 使用 `build_contract()` 替代。
-一次性页面检查在 `selenium_runtime.inspect_page()`；实时观察仍为
-`dom_inspector.observe_session(driver)`。
-
-每次产物在独立 `artifacts/<run_id>/`。Dynamic 的主要文件：
-
-- `test_inputs.json`、`input_review.json`、`test_contract.json`：原始输入、审核、Oracle 引文与位置。
-- `agent3_debug.json`、`generated_test.py`、`agent3_delivery.json`：开发记录、冻结源码/哈希和冷启动交付。
-- `agent3_cold_trial_*.json`、`formal_evidence.json`、`trial/`、`formal/`：独立执行及 DOM/截图/测量引用。
-- `final_verdict.json`、`cleanup.json`、`llm_calls.json`、`report.md`：结论、清理、调用元数据及运行说明。
-
-## 保留的旧入口
-
-以下仍为固定搜索模板，用于离线/浏览器回归，不是自由 Dynamic 编码：
+默认回归不调用真实模型，真实 Chrome 用例需要显式启用：
 
 ```powershell
-.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template
-.\.venv\Scripts\python.exe run_demo.py --target fixture-bug --mode template
-.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template --demo-evidence-gap
-.\.venv\Scripts\python.exe run_demo.py --target fixture --mode template --demo-broken-locator
-.\.venv\Scripts\python.exe run_infrastructure_check.py --driver-path $env:CHROMEDRIVER_PATH
-.\.venv\Scripts\python.exe -m streamlit run app_ui.py
+.\.venv\Scripts\python.exe -m pytest -q
+
+# 配置好 Chrome / Driver 后，运行本地日期浏览器用例
+$env:WEBAGENT_RUN_BROWSER_TESTS = '1'
+.\.venv\Scripts\python.exe -m pytest -q tests/test_date_browser_live.py tests/test_calendar_browser_live.py tests/test_date_navigation_browser_live.py
+Remove-Item Env:WEBAGENT_RUN_BROWSER_TESTS
 ```
 
-`--target arxiv` 也是旧固定入口；任意任务应使用 Dynamic 并指定授权 URL。
-不因旧测试名包含 v0.2/v0.3 就删除仍有效的异常处理、取证和契约回归。
+2026-11-10 完整离线回归结果为 **467 passed、29 skipped**。跳过项不能算作浏览器验证；本地日期导航三个 Chrome 场景已另行启用实测，覆盖双向跨年和按钮无变化时的技术失败。其脚本由人工编写，只证明导航策略、浏览器交互和独立取证；跨年生成及审核提示词增强尚未用真实模型复验。
 
-## 边界与验收
+已保存的真实 DeepSeek + Chrome 验收包括：
 
-本地子进程与受限解释器都不是操作系统沙箱，没有文件/网络/CPU/内存权限隔离。
-Worker 不继承模型凭据；禁止任意 Python、Shell、反射和系统文件读取。
-页面内容是不可信数据。复杂窗口选择、iframe/Shadow DOM 完整遍历、自定义控件的
-全面负面证明尚不支持；证据不足保持 INCONCLUSIVE，技术故障仍为 ERROR。
-浏览器 Profile 重置不等于远端服务端数据重置，有副作用操作需授权及可重放环境。
+| 场景 | 冻结规格与正式观察 | 结果 |
+| --- | --- | --- |
+| 正常提交反馈（Demo A） | 预期 Received!，正式观察 Received! | PASS |
+| 错误反馈规格（Demo B） | 人为指定 Accepted!，正式观察 Received! | FAIL |
+| 必要控件缺失（Demo C） | 人为要求可见 Reset，正式证据确认不存在 | FAIL |
+| 日期语义与关联取证 | 输入值 11/10/2026，由关联正式日历确认 2026-11-10 | PASS |
 
-v0.5 架构清理的基线、模块依赖前后对比、删除理由、pytest 与三项真实模型/Chrome
-回归记录见 `docs/v05_architecture_cleanup_acceptance.md` 和
-`artifacts/v05_architecture_cleanup/`。Mock 测试不替代真实端到端验收。
-`AGENTS.md`、`docs/` 和运行产物当前被 `.gitignore` 忽略，不会自动同步到其他克隆；
-README 和源码中的说明可随仓库共享。
+Demo A/B 也经过真实 Streamlit 操作台验收。B/C 验证的是对错误规格的识别，**不代表 Selenium 官方网站有 Bug**。日期正式 PASS 运行 ID 为 `dynamic_20261110_085230_f186a7`；更早缺少关联证据的运行保持 INCONCLUSIVE，没有事后改判。
 
-v0.6 前端及分阶段浏览器模式的验收见 `docs/v06_frontend_acceptance.md` 与
-`artifacts/v06_ui_acceptance/`；未通过的真实运行不会以离线测试替代。
-本轮演示布局、历史查看和证据选择优化见 `docs/v06_presentation_acceptance.md` 与
-`artifacts/v06_presentation_acceptance/`，真实验收严格限于 A/B 各一次。
+这些结果限于已执行场景，不构成跨网站稳定性保证。本地私有验收记录未随仓库发布，README 不将其作为可下载材料链接。回归源码位于 [tests/](tests/)，覆盖来源、类型、冻结一致性、独立证据、故障恢复、凭据隔离及日期边界。
+
+## 目录与运行产物
+
+```text
+app_ui.py                 Streamlit 操作台
+run_demo.py               CLI 入口
+web_agent/agents/         六角色实现
+web_agent/pipeline.py     编排与预算
+web_agent/schema.py       契约与来源校验
+web_agent/selenium_runtime.py / local_worker.py
+                          浏览器会话、超时和清理
+web_agent/checked_selenium.py
+                          受限解释与统一取证
+web_agent/dom_inspector.py
+                          当前 DOM 观察
+web_agent/date_semantics.py / calendar_state.js
+                          日期语义及关联快照
+web_agent/llm_adapter.py   控制侧模型适配
+tests/                    离线和可选本地浏览器回归
+artifacts/                本地运行产物，默认忽略
+```
+
+每次 Dynamic 测试写入独立运行目录，包含原始输入、冻结契约、生成源码与交付哈希、冷启动记录、Formal 证据、最终判定、模型调用元数据和清理记录。`.env`、缓存、运行产物及本地开发报告默认被 [.gitignore](.gitignore) 排除；分享运行材料前仍需检查个人路径、页面数据和日志。
+
+## 能力边界
+
+- 已有有限的同源新窗口跟随与回归覆盖；复杂多窗口选择、iframe、Shadow DOM 和非标准控件未充分验证。
+- 日期控件只支持当前明确实现的关联结构；相对日期、缺少年份、时区时间、多选及浏览器原生弹窗等不能保证自动处理。
+- LLM 可能产生不稳定或不可执行的代码；有限调试与审核不能保证任意程序正确。
+- 本地子进程、Profile 隔离和受限解释器不提供操作系统级文件、网络或资源安全隔离。
+- 浏览器重置不等于远端数据重置。购买、删除、账号修改等有副作用操作需要明确授权和可重置的测试环境。
+- 当前面向本地单任务使用；不宣称可在任意网站稳定执行，也未完成全部模型服务商的真实账户验收。
