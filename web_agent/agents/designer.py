@@ -47,6 +47,15 @@ If a source specifies literal feedback/message text, preserve that STRING as exp
 with equals/contains; do not reduce "displays <specified message>" to expected=true.
 Checking a feedback element exists cannot verify its specified contents. Keep the
 source's stated value even if prior website knowledge suggests a different response.
+For a requested calendar date use date_equals, NOT literal equals with a Chinese
+date string or an invented localized display. Preserve the exact source quotation.
+If an exact display string is explicitly requested, add a separate equals Oracle.
+Do not infer CSS/XPath, aria-label, role or accessible names from nearby words.
+"Input next to Date picker" describes a spatial interaction target, not a proven
+textbox named Date picker; omit target and let Agent3 inspect its actual DOM.
+Preserve an explicitly required calendar interaction: click to open, inspect the
+calendar, navigate to the requested month/year if needed, then select the date.
+Separate state-changing interactions into steps so the next step sees updated DOM.
 No URLs outside the authorized origin, logins, downloads or destructive remote effects.'''
         system += '\n' + ORACLE_GUIDE + '\n' + ORACLE_SOURCE_GUIDE + '\n' + TARGET_GUIDE
         data = llm.complete_json(system, json.dumps(dict(requirement=requirement, start_url=url,

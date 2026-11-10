@@ -30,7 +30,8 @@ ATTRIBUTES = frozenset({'get', 'find_element', 'find_elements', 'click', 'clear'
 ROOT_NAMES = {'driver', 'BASE_URL', 'By', 'Keys', 'EC', 'WebDriverWait', 'len'}
 OBSERVED_ATTRIBUTES = frozenset({'id', 'name', 'type', 'value', 'class', 'href', 'checked',
     'textContent', 'aria-label', 'aria-checked', 'aria-expanded', 'aria-disabled',
-    'data-testid', 'disabled', 'selected', 'role', 'placeholder', 'target', 'formtarget'})
+    'data-testid', 'disabled', 'selected', 'role', 'placeholder', 'target', 'formtarget',
+    'data-date-format', 'data-format', 'data-date'})
 LOCATORS = {'css': 'css selector', 'css selector': 'css selector', 'css_selector': 'css selector',
             'xpath': 'xpath', 'id': 'id', 'name': 'name'}
 READS = {'count', 'text', 'texts', 'selected', 'selected_text', 'visible', 'enabled', 'attribute', 'exists', 'visible_exists', 'target_present'}
@@ -43,6 +44,14 @@ def rendered_text_script():
     return Path(__file__).with_name('rendered_text.js').read_text(encoding='utf-8')
 
 
+@lru_cache(maxsize=1)
+def date_value_script():
+    from pathlib import Path
+    from .dom_inspector import displayed_atom
+    return ('const displayed = (' + displayed_atom() + ');\n'
+            + Path(__file__).with_name('calendar_state.js').read_text(encoding='utf-8'))
+
+
 EVIDENCE_GUIDE = '''Trusted Runtime evidence semantics (not model Python return values):
 by supports css/xpath/id/name. count returns an INTEGER of VISIBLE matched elements
 (is_displayed filtered); texts returns their visible text list. Neither counts hidden
@@ -53,6 +62,17 @@ the native state of exactly ONE existing target; missing/ambiguous targets are U
 not false. text reads one visible target; text/texts use complete rendered light-DOM
 text (hidden descendants excluded), not a 1000-character prefix. Incomplete/oversize
 text is UNKNOWN, never a truncated PASS/FAIL. attribute reads an allowed attribute string.
+attribute(value) also records date_context from the SAME actual DOM node: tag, type,
+and data-date-format/data-format/placeholder. Do not put format/date_context in bindings.
+For date_equals bind attribute="value" on the date input, or text on a date display.
+ISO/Chinese dates are self-describing; slash dates require explicit observed format
+attributes. Native input[type=date] DOM value is ISO, not its localized display.
+Missing/conflicting format evidence is INCONCLUSIVE, never a guessed PASS.
+For unknown input formats, the same read also captures a bounded calendar snapshot.
+Supported associations: unique aria-controls to a visible grid with aria-selected;
+or a validated datepicker instance linking this exact input, picker and Date state.
+active/today/hover classes alone are not selection proof. Calendar metadata and
+provenance are trusted collector output, never fields allowed in model bindings.
 selected_text reads the displayed label of the selected option of ONE native select,
 e.g. value="all" with label "All fields" returns "All fields", not "all".
 Missing/hidden select or missing/ambiguous selected options are UNKNOWN. Target the
@@ -368,7 +388,32 @@ return arguments[0].map(el => ({
                 method = {'selected': 'is_selected', 'visible': 'is_displayed', 'enabled': 'is_enabled'}[kind]
                 value = run(kind,lambda: getattr(wrapped[0], method)())
             elif kind == 'attribute':
-                raw = run('attribute',lambda: wrapped[0].get_attribute(query['attribute']))
+                if query['attribute'] == 'value' and batch:
+                    # Fixed trusted read, not model JavaScript. Capture the value
+                    # and its interpretation context atomically on the same node.
+                    row = run('attribute', lambda: driver.execute_script(date_value_script(), nodes[0]))
+                    raw = row['value']
+                    details['date_context'] = dict(tag=safe_text(row['tag'],40),type=safe_text(row['type'],40),
+                        format_attributes={k:safe_text(v,80) for k,v in row['format_attributes'].items()})
+                    if 'calendar' in row:
+                        # Metadata contains only bounded public DOM identity/state.
+                        # Apply the normal text redactor recursively as for other DOM observations.
+                        def redact(item):
+                            if isinstance(item, str): return safe_text(item,2000)
+                            if isinstance(item, list): return [redact(v) for v in item]
+                            if isinstance(item, dict): return {k:redact(v) for k,v in item.items()}
+                            return item
+                        details['date_context']['input_ref'] = row['input_ref']
+                        details['calendar_evidence'] = redact(row['calendar'])
+                else:
+                    raw = run('attribute',lambda: wrapped[0].get_attribute(query['attribute']))
+                    if query['attribute'] == 'value':
+                        # Minimal native-adapter compatibility; production uses
+                        # the atomic managed path above.
+                        details['date_context'] = dict(tag=str(getattr(nodes[0], 'tag_name', '')).lower(),
+                            type=(nodes[0].get_attribute('type') or '').lower(),
+                            format_attributes={k:safe_text(nodes[0].get_attribute(k),80)
+                                for k in ('data-date-format','data-format','placeholder')})
                 value = (safe_href(raw) if query['attribute'] == 'href' else safe_text(raw, len(raw))) if raw is not None else None
                 if raw is None:
                     status = 'attribute_missing'

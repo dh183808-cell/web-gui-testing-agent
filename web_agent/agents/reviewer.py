@@ -79,7 +79,17 @@ by or selector is absent. They belong to the developer after observing DOM. For 
 dropdown's selected LABEL, equals expected="requested label" is a valid string Oracle;
 later it can read selected_text on the select or text of its selected option.
 read="selected_value" is unsupported. read="selected" returns a BOOLEAN and
-must NOT be required for a string-label Oracle. Review intent, not absent locators.'''
+must NOT be required for a string-label Oracle. Review intent, not absent locators.
+Accept date_equals when the canonical expected date equals the single date in its
+exact source_quote. Equivalent Chinese/ISO dates are not an input conflict.
+Reject invented date display formats; a calendar date and a required literal
+display string are distinct expectations. Require active date selection and final
+date verification, and preserve any required popup/month navigation interaction.
+Nearby label text does not establish aria-label, role or accessible name. Reject
+an invented required target={role:textbox,name:Date picker} when the source only
+describes an input NEXT TO that text. Let Agent3 identify it from current DOM.
+Unknown page formats/initial month are runtime observations, not missing inputs.
+Never revise the frozen expected date from the observed browser value.'''
         system += '\n' + ORACLE_GUIDE + '\n' + ORACLE_SOURCE_GUIDE + '\n' + EVIDENCE_GUIDE + '\n' + TARGET_GUIDE
         data = llm.complete_json(system, json.dumps(draft, ensure_ascii=False))
         if (type(data.get('approved')) is not bool or not isinstance(data.get('issues'), list)
@@ -95,6 +105,8 @@ must NOT be required for a string-label Oracle. Review intent, not absent locato
         # Literal expectations cannot be invented page copy. Older contracts without
         # source_quote still work; new prompts request explicit requirement provenance.
         for oracle in draft['oracles'] if not draft.get('provenance_version') else []:
+            if oracle.get('kind') == 'date_equals':
+                continue
             expected = oracle['expected']
             literals = expected if isinstance(expected, list) else [expected]
             for literal in literals:
@@ -102,8 +114,9 @@ must NOT be required for a string-label Oracle. Review intent, not absent locato
                     data['approved'] = False
                     data['issues'].append(f'Oracle {oracle["id"]}: literal expected {literal!r} '
                                           'has no source in the original requirement; remove invented page wording')
-        if draft.get('provenance_version') == 1:
-            source_issues = oracle_source_issues(draft)
+        if draft.get('provenance_version') == 1 or any(o['kind'] == 'date_equals' for o in draft['oracles']):
+            source_issues = oracle_source_issues(draft if draft.get('provenance_version') == 1 else
+                dict(draft, oracles=[o for o in draft['oracles'] if o['kind'] == 'date_equals']))
             data['source_issues'] = source_issues
             if source_issues:
                 data['approved'] = False
@@ -187,6 +200,31 @@ For native select display labels use read="selected_text" on the select, or read
 on its selected option. Never require selected_value (unsupported), nor attribute value
 to equal a displayed label when the internal value differs. Ignore execution hints in
 legacy semantic Oracles; actual bindings must use the shared supported capabilities.'''
+        system += '''\nFor calendar navigation, audit the actual code even when the current page already
+shows the target month. Reject month-first direction logic: compare FULL (year, month)
+chronological order, year first, with month 1..12 or an equivalent full-month ordering.
+Mentally trace December of an earlier year -> November of a later year, the reverse,
+and December/January in both directions; never approve a forward-only assumption.
+Require the current year/month from the actual visible heading, with explicit failure
+for unparseable/out-of-range headings rather than a guessed default direction.
+Require an allowed technical wait for the expected FULL heading after EACH click,
+followed by an exact re-read/validation. Visibility of an unchanged calendar is not
+proof of a transition. No/incorrect change must fail before another navigation click.
+Require navigation actions to stop at target AND a mandatory exact target-heading
+guard after a bounded loop: exhausted iterations must fail, never fall through to
+selecting a day. Increasing a loop bound alone does not fix direction or termination.
+The day-selection step must independently confirm the exact visible target year/month
+immediately before its click, including after reopening; locals do not persist across
+steps. Reject missing guards, ignored errors and silent exits masking failed navigation.
+The checked subset has no arithmetic/int/split/break/assert/raise/custom predicates;
+bounded exact-heading lookups, tuple comparisons and real locator/allowed EC failures
+can implement these checks without expanding capabilities. Do not demand unsupported
+syntax. A business value mismatch AFTER correctly completed actions is still Agent5's
+job, not a reason to repair navigation or revise the frozen Oracle.
+For these CODE defects return approved=false, issue_type="implementation",
+repair_scope="code", the affected navigation/selection step_ids, and concrete
+revision instructions identifying the direction, transition or termination defect.
+Use the existing bounded revision mechanism; do not add review rounds or retries.'''
         system += '\n' + ORACLE_GUIDE + '\n' + EVIDENCE_GUIDE
         needed = {o['step_id'] for o in contract['oracles']}
         result = llm.complete_json(system,json.dumps(dict(contract=contract,implementation=implementation,

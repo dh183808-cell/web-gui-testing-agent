@@ -119,6 +119,11 @@ def checked_execution(driver, base_url, request, *, capture, save_screenshot, re
             result['screenshot_ref'] = name
             for m in result['measurements'].values():
                 m.update(observation_ref=current['observation_ref'],screenshot_ref=name)
+                if 'calendar_evidence' in m:
+                    # Bound to this capture; the controller adds owned session identity.
+                    m['calendar_evidence']['provenance'] = dict(step_id=request.get('step_id'),
+                        observation_ref=current['observation_ref'],screenshot_ref=name,
+                        url=current['url'],window=current.get('current_window'))
     except Exception as exc:
         result['observation_error_type'] = type(exc).__name__
         if result['status'] == 'COMPLETE':

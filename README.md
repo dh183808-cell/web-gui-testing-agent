@@ -114,6 +114,20 @@ Pipeline 管阶段、权限、预算和终止；Agent 不自行调用其他 Agen
 CLI 对 PASS 或仅规划正常返回 0；FAIL、ERROR、INCONCLUSIVE 的完整运行返回 1。
 非零退出码本身不能证明 Selenium 执行异常，应读取 `final_verdict.json`。
 
+日期目标使用 `date_equals`，例如来源“选择日期为2026年11月10日”对应
+`expected="2026-11-10"`。可信逻辑会校验真实日历、唯一日期及原文引用位置；
+这不代表用户要求页面采用 ISO 显示格式。明确的显示字符串要求需另用 `equals`。
+正式读取日期输入框 `attribute(value)` 时，会同时采集同一 DOM 节点的类型和
+`data-date-format` / `data-format` / `placeholder`。原生日期控件的 DOM value 按 ISO
+解释；斜杠日期优先使用明确的 `MM/DD/YYYY` 或 `DD/MM/YYYY` 格式依据。格式未知时，
+同次读取还会尝试采集与输入框唯一关联的正式日历选中态：支持 `aria-controls` 指向
+`aria-selected` 网格，以及输入框/弹窗/日期状态相互一致的受限 datepicker 实例结构。
+日历年月日须与输入原始值的一种有效解释一致，且来自同一 Formal 会话、步骤和取证。
+多候选、仅截图、仅 today/active 类名或证据冲突均不能据此 PASS；普通文本比较规则不变。
+弹窗关闭时需要由 Agent3 将安全的重新打开操作写入冻结脚本并完成冷启动；正式执行器
+不会临时补操作。旧运行缺少关联元数据时，不能事后改判为 PASS。
+目前不支持相对日期、无年份日期、时区时间，以及所有第三方/浏览器原生日历弹窗的自动操作。
+
 ## 模块职责
 
 | 模块 | 用途 |

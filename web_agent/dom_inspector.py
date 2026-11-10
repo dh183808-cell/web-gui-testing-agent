@@ -95,7 +95,9 @@ def _soup(html):
         for key in list(tag.attrs):
             if key not in {'id', 'class', 'name', 'type', 'role', 'aria-label', 'aria-checked',
                            'aria-expanded', 'data-testid', 'placeholder', 'for',
-                           'href', 'target', 'formtarget', 'disabled', 'checked', 'selected', 'hidden', 'aria-disabled'}:
+                           'href', 'target', 'formtarget', 'disabled', 'checked', 'selected', 'hidden', 'aria-disabled',
+                           'data-date-format', 'data-format', 'data-date', 'aria-controls',
+                           'aria-labelledby', 'aria-selected', 'aria-current', 'data-outside-month'}:
                 del tag.attrs[key]
             elif key == 'href':
                 tag.attrs[key] = safe_href(str(tag.attrs[key]))
@@ -193,6 +195,10 @@ def compact_dom(html: str, max_elements: int = 120, *, max_text: int = 120,
     return {"title": (soup.title.get_text(" ", strip=True) if soup.title else "")[:140],
             "elements": elements, "count": len(elements), 'total_candidates': len(candidates),
             'content_regions': content_regions,
+            # Keep bounded table/grid markup so calendar headings, month/year
+            # choices and day attributes survive a long page's HTML prefix.
+            # These are untrusted candidates; visibility must be checked live.
+            'calendar_regions': [str(t)[:5000] for t in region.select('table,[role="grid"]')[:3]],
             'text_matches': text_matches,
             'locator_notes': 'href_path omits userinfo/query values and may be relative or resolved; '
                              'it is not the literal href attribute. Plain #anchors stay on this document. '
@@ -233,7 +239,9 @@ for (const el of candidates) {
     if (["hidden","password"].includes(attr("type").toLowerCase()) || sensitive.test(identity)) continue;
     const visible = displayed(el);
     live.push({tag:el.tagName.toLowerCase(), id:attr("id"), name:attr("name"),
-        ...Object.fromEntries(["class","type","data-testid","role","aria-checked","aria-expanded","aria-label","target","formtarget"]
+        ...Object.fromEntries(["class","type","data-testid","role","aria-checked","aria-expanded","aria-label","target","formtarget",
+            "data-date-format","data-format","placeholder","aria-controls","aria-labelledby",
+            "aria-selected","aria-current"]
             .map(k => [k,attr(k).slice(0,160)])),
         href_path:String(el.href || attr("href")), visible, enabled:!el.matches(":disabled"),
         text:visible ? (el.innerText || el.textContent || "").slice(0,textLimit) : "",

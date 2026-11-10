@@ -15,6 +15,7 @@ from typing import Any
 from ..evidence_plan import get_path
 from ..probe_plan import make_probe_request
 from ..schema import Verdict, NUMERIC_ORACLES, finite_number, validate_oracle_binding
+from ..date_semantics import compare_date
 
 
 class Agent5EvidenceVerifier:
@@ -28,6 +29,8 @@ class Agent5EvidenceVerifier:
             measurement = evidence.get('measurements', {}).get(oracle['id'], {})
             actual = measurement.get('value')
             expected = oracle['expected']
+            date_comparison = dict(expected=expected, raw_actual=actual, normalized_actual=None,
+                                   reason='Complete independent Formal date evidence not established')
             skipped = next((s for s in evidence.get('skipped_steps',[])
                             if s['step_id']==oracle.get('step_id')),None)
             if measurement.get('read'):
@@ -61,6 +64,15 @@ class Agent5EvidenceVerifier:
                 # A redundant model locator may also miss the claimed control.
                 # It cannot independently convert an incomplete inventory to FAIL.
                 passed = None
+            elif oracle['kind'] == 'date_equals':
+                if (evidence.get('purpose') != 'formal' or not measurement.get('read')
+                        or measurement.get('step_id') != oracle.get('step_id')
+                        or measurement.get('visible') != 1 or measurement.get('matched') != 1):
+                    passed = None
+                    date_comparison = dict(reason='Independent visible Formal date measurement required',
+                                           expected=expected, raw_actual=actual, normalized_actual=None)
+                else:
+                    passed, date_comparison = compare_date(expected, measurement,formal_context=evidence)
             elif oracle['kind'] == 'equals':
                 passed = type(actual) is type(expected) and actual == expected
             elif oracle['kind'] == 'set_equals':
@@ -73,6 +85,7 @@ class Agent5EvidenceVerifier:
             checks.append(dict(oracle_id=oracle['id'], meaning=oracle['meaning'], expected=expected,
                                actual=actual, passed=passed, observation_ref=measurement.get('observation_ref'),
                                screenshot_ref=measurement.get('screenshot_ref'),
+                               **({'date_comparison':date_comparison} if oracle['kind']=='date_equals' else {}),
                                **{k:oracle[k] for k in ('source_type','source_quote','source_span') if k in oracle},
                                binding={k: measurement[k] for k in ('by','selector','read','step_id','attribute','target') if k in measurement},
                                evidence_status='not_executed' if skipped else measurement.get('status',

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import math
 from typing import Any, Literal, Protocol
+from .date_semantics import expected_date, validate_date_source
 
 VERDICTS = {"PASS", "FAIL", "ERROR", "INCONCLUSIVE"}
 NUMERIC_ORACLES = {'gte', 'gt', 'lte', 'lt'}
@@ -12,7 +13,13 @@ ORACLE_GUIDE = '''Oracle kinds: equals (same JSON type and value), contains (tex
 membership), set_equals (list equality ignoring order), gte/gt/lte/lt (finite numeric
 comparison, never boolean coercion). "At least one result" should use kind="gte",
 expected=1 with read="count", OR kind="equals", expected=true with read="visible_exists".
-A numeric count is NOT a boolean. Never change the expected value to fit observed data.'''
+A numeric count is NOT a boolean. date_equals compares calendar dates, expected MUST
+be canonical YYYY-MM-DD. The exact source_quote must contain ONE unambiguous date
+(Chinese year/month/day or ISO), deterministically equivalent to expected. Narrow
+quotes containing multiple dates. Never guess month/day order in a slash date.
+A date target does not prescribe its display format. Use a separate sourced equals
+Oracle ONLY when the user explicitly requires an exact displayed string.
+Never change the expected value to fit observed data.'''
 
 ORACLE_SOURCE_GUIDE = '''Two separate inputs: test_basis is optional software instructions,
 specification or acceptance rules; requirement is what the user wants to test NOW.
@@ -62,6 +69,12 @@ def oracle_source_issues(plan):
                 or span.get('line') != source.count('\n', 0, start) + 1):
             issues.append(f'{label}: source_span does not identify its source_quote in {source_type}')
         expected = oracle.get('expected')
+        if oracle.get('kind') == 'date_equals':
+            try:
+                validate_date_source(expected, quote)
+            except ValueError as exc:
+                issues.append(f'{label}: {exc}')
+            continue
         literals = expected if isinstance(expected, list) else [expected]
         for literal in literals:
             if isinstance(literal, str) and literal not in quote:
@@ -156,7 +169,11 @@ def validate_oracle_binding(oracle, binding):
             raise ValueError(f'{prefix}: required target must use target_present with the SAME frozen target; '
                              'an empty CSS/XPath match does not establish absence')
         return
-    if kind in NUMERIC_ORACLES or kind == 'equals' and finite_number(expected):
+    if kind == 'date_equals':
+        allowed = {'text', 'attribute'}
+        if read == 'attribute' and binding.get('attribute') != 'value':
+            raise ValueError(f'{prefix}: date_equals attribute read must measure value')
+    elif kind in NUMERIC_ORACLES or kind == 'equals' and finite_number(expected):
         allowed = {'count'}
     elif kind == 'equals' and type(expected) is bool:
         allowed = {'exists', 'visible_exists', 'selected', 'visible', 'enabled'}
@@ -191,11 +208,13 @@ def validate_dynamic_plan(plan, *, allow_incomplete=False, check_sources=True):
     oracle_ids = set()
     for oracle in oracles:
         if (not isinstance(oracle.get('id'), str) or oracle['id'] in oracle_ids
-                or oracle.get('step_id') not in ids or oracle.get('kind') not in {'equals','contains','set_equals'} | NUMERIC_ORACLES
+                or oracle.get('step_id') not in ids or oracle.get('kind') not in {'equals','contains','set_equals','date_equals'} | NUMERIC_ORACLES
                 or 'expected' not in oracle or not isinstance(oracle.get('meaning'), str)):
             raise ValueError('Invalid semantic oracle')
         if oracle['kind'] in NUMERIC_ORACLES and not finite_number(oracle['expected']):
             raise ValueError(f'Oracle {oracle["id"]}: numeric comparison requires a finite number, not bool')
+        if oracle['kind'] == 'date_equals':
+            expected_date(oracle['expected'])
         if 'target' in oracle:
             validate_target(oracle['target'])
             if oracle['kind'] != 'equals' or oracle['expected'] is not True:
@@ -216,6 +235,12 @@ def validate_dynamic_plan(plan, *, allow_incomplete=False, check_sources=True):
             raise ValueError('; '.join(issues))
     if check_sources and plan.get('provenance_version') == 1:
         issues = oracle_source_issues(plan)
+        if issues:
+            raise ValueError('; '.join(issues))
+    elif check_sources:
+        # Compatibility for old kinds is unchanged; a new date Oracle always
+        # requires full provenance, even if its version field was omitted.
+        issues = oracle_source_issues(dict(plan, oracles=[o for o in oracles if o['kind'] == 'date_equals']))
         if issues:
             raise ValueError('; '.join(issues))
 

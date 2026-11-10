@@ -384,6 +384,13 @@ class LocalSession:
                                       'queries': queries, 'phase_limits':phase_limits}, sum(phase_limits.values()))
             observation = response.pop('observation', None)
             result.update(response)
+            for measurement in result.get('measurements', {}).values():
+                if 'calendar_evidence' in measurement:
+                    measurement['evidence_id'] = uuid.uuid4().hex
+                    measurement['calendar_evidence'].setdefault('provenance', {}).update(
+                        purpose=self.purpose,session_id=self.session_id,
+                        browser_session_id=response.get('browser_session_id'),
+                        evidence_id=measurement['evidence_id'])
             if observation:
                 self._remember(observation)
                 result.update(current_url=self._last_url, observation_ref=self._last_observation_ref)

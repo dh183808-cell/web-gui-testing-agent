@@ -165,6 +165,58 @@ Use native option.click() on the option identified from current DOM; Select is n
 an injected capability. Follow the reviewed choice even if the initial value differs.
 Evidence must match the Oracle type; local variables like result=[...] do NOT become
 trusted measurements. Do not turn numeric counts into booleans yourself.'''
+        system += '''\nFor dates, identify the actual input from observed DOM and label/container
+relationships, not an assumed accessible name. Re-observe after opening a calendar
+and after month/year view changes. calendar_regions contains untrusted table/grid
+candidates, including hidden views: scope to the actually visible view and wait.
+Never assume its initial month/year equals the target. Use observed heading and
+navigation controls; if a heading opens month/year choices, use those actual controls
+in preference to a guessed number of next/previous clicks. Follow explicit popup
+selection requirements through native clicks; do not type into the field instead
+or use JavaScript to set its value. Avoid a day locator that also matches adjacent
+months. A target date is action data, not permission to overwrite a measurement.
+Read the final input value with attribute(value). The trusted collector attaches
+actual DOM type/format attributes automatically. Do not invent a format in bindings.
+Unspecified defaults, date displays and current month remain unknown until observed.
+When no explicit date format is exposed, attribute(value) automatically attempts
+linked calendar evidence: a unique aria-controls grid with aria-selected, or a
+validated datepicker instance linking the input/picker/selected Date state. active,
+today or hover classes alone are insufficient. Never supply calendar metadata or
+invent a link between a nearby popup and an input. Multiple candidates stay unknown.
+The FINAL date-read checkpoint must see the selected day/month/year. If selection
+closes the popup, include a safe explicit reopening click and visibility wait in
+your saved final-step code, without reselecting any date or changing the field.
+This operation must run in Trial, cold replay and Formal as the same frozen source;
+the executor never injects reopening actions. If reopening is unsafe or unsupported,
+leave the evidence incomplete rather than manufacturing a selected state.
+Do not wait for the expected final business date value: measure the actual result.
+Native browser calendar chrome outside DOM may be unsupported; report that limit.'''
+        system += '''\nCalendar navigation is a technical action precondition, not the final date Oracle.
+Determine direction by the FULL (year, month) chronological order, year first and
+month 1..12. Month-first comparisons are wrong across years (December of an earlier
+year can be BEFORE November of a later year). Re-read the actual VISIBLE heading;
+never infer the current month from click counts or assume the popup starts at target.
+Stay inside the checked Python subset: arithmetic/int/split/break/assert/raise and
+custom wait predicates are unavailable. Tuple comparisons of integer (year, month)
+are supported. If needed, use a SMALL bounded lookup of exact full heading strings
+to year/month and adjacent full headings, covering the supported navigation range;
+do not guess by ambiguous substrings or default an unparsed title to a direction.
+Use the observed controls, including both previous and next when navigating months.
+After EACH click, wait for the expected FULL next year/month on the actual heading
+using an allowed EC predicate, then read and validate the exact heading again before
+any further click. Merely waiting for the same container to stay visible is insufficient.
+Stop navigation actions immediately on reaching the target; a bounded for loop can
+guard its body when already at target (break is unavailable). Keep the original bound.
+After the loop, require the exact target heading through a real DOM locator/wait;
+exhaustion, an unparseable heading or no/incorrect transition must produce a technical
+execution error and prevent selection. Use existing lookup/locator/EC failures, never
+invent an absent element, swallow a failure or silently continue. If this cannot be
+implemented with observed controls and allowed capabilities, report the limitation.
+In the DATE-SELECTION step, self-containedly re-read and require the exact visible
+target year/month IMMEDIATELY BEFORE clicking the day, even if a preceding step
+navigated successfully or a popup was reopened. Do not select in a wrong month.
+These heading guards establish the requested interaction state. Never wait for the
+final input's business date equality or retry correct selection to force Oracle PASS.'''
         system += '\n' + ORACLE_GUIDE + '\n' + EVIDENCE_GUIDE
         system += '''\nA frozen Oracle with target={role,name} is a REQUIRED TARGET check.
 Use ONLY a read-only driver.title statement for that dedicated presence-check step;
