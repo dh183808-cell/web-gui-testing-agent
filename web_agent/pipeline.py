@@ -42,7 +42,12 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
                  start_url: str | None = None, allow_local_research: bool = False,
                  step_attempts: int = 3, task_repairs: int = 5,
                  test_basis: str | None = None, formal_headless: bool | None = None,
-                 progress_callback=None, formal_demo_delay: float = 0.0) -> dict:
+                 progress_callback=None, formal_demo_delay: float = 0.0,
+                 run_mode: str = 'normal', demo_layout=None) -> dict:
+    if run_mode not in {'normal', 'demo'}:
+        raise ValueError('Invalid run mode')
+    if run_mode == 'demo' and target != 'dynamic':
+        raise ValueError('Demo Mode requires the Dynamic Pipeline')
     if test_basis is not None and not isinstance(test_basis, str):
         raise ValueError('test_basis must be plain text')
     test_basis = test_basis or ''
@@ -56,7 +61,7 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
                             step_attempts=step_attempts, task_repairs=task_repairs,
                             test_basis=test_basis, only_generate=only_generate,
                             formal_headless=formal_headless, progress_callback=progress_callback,
-                            formal_demo_delay=formal_demo_delay)
+                            formal_demo_delay=formal_demo_delay, run_mode=run_mode, demo_layout=demo_layout)
     if target == 'arxiv' and not allow_live_site:
         raise ValueError('真实 arXiv 运行需要确认网站许可与访问规则：--allow-live-site')
     if target not in {'arxiv', 'fixture', 'fixture-bug'}:
@@ -220,7 +225,8 @@ def run_pipeline(*, requirement: str = DEFAULT_REQUIREMENT, target: str = 'fixtu
 
 def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, model,
                  step_attempts, task_repairs, test_basis='', only_generate=False,
-                 formal_headless=None, progress_callback=None, formal_demo_delay=0.0):
+                 formal_headless=None, progress_callback=None, formal_demo_delay=0.0,
+                 run_mode='normal', demo_layout=None):
     """Dynamic branch in the existing Pipeline; six Agents retain their roles."""
     import hashlib
     import time
@@ -228,6 +234,9 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
     from .selenium_runtime import create_session, RuntimeLimits, ARTIFACT_ROOT
     from .schema import validate_dynamic_plan
     from .selenium_runtime import validate_presentation_delay
+    from .desktop_layout import freeze_presentation, session_display
+    presentation = freeze_presentation(run_mode, demo_layout)
+    demo = run_mode == 'demo'
     formal_demo_delay = validate_presentation_delay(formal_demo_delay)
     if not url or not requirement.strip():
         raise ValueError('Explicit URL and natural language requirement are required')
@@ -251,13 +260,20 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         _write_json(run_dir / name, value)
 
     write('test_inputs.json',dict(requirement=requirement,test_basis=test_basis))
+    write('presentation.json', presentation)
 
     def event(agent, action, **data):
+        if demo:
+            # Presentation metadata is bounded and excludes terminal controls/common credentials.
+            from .demo_console import safe_display
+            for key in ('code','goal','warning'):
+                if key in data: data[key] = safe_display(data[key])
         record = dict(agent=agent, action=action, stage=stage,
                       elapsed_seconds=round(time.monotonic()-started,3), **data)
         events.append(record)
         write('events.json', events)
-        print(agent + ': ' + action, flush=True)
+        if not demo:
+            print(agent + ': ' + action, flush=True)
         if progress_callback:
             try:
                 progress_callback(dict(record))
@@ -290,10 +306,11 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
             return value
 
     def session(purpose, reason):
-        shown_headless = headless if purpose != 'formal' or formal_headless is None else formal_headless
+        display = session_display(presentation, purpose, reason, headless, formal_headless)
+        shown_headless = display['headless']
         event('Runtime','session_starting',purpose=purpose,reason=reason,headless=shown_headless)
         s = create_session(run_dir, purpose=purpose, start_url=url, research_mode=True,
-                           limits=limits, headless=shown_headless,
+                           limits=limits, **display,
                            formal_demo_delay=formal_demo_delay if purpose == 'formal' else 0.0)
         sessions.append(s)
         s.progress_callback = lambda action, **data: event('Runtime', action, phase=reason,
@@ -303,6 +320,10 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
               session_id=getattr(s,'session_id',None),
               browser_headless=getattr(s,'metadata',{}).get('browser_headless'),
               browser_session_id=getattr(s,'metadata',{}).get('browser_session_id'))
+        if demo:
+            layout = getattr(s,'metadata',{}).get('window_layout') or {}
+            if layout.get('warning'):
+                event('Runtime','layout_warning',warning=layout['warning'])
         return s
 
     def close(s, reason):
@@ -376,14 +397,18 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                                  previous_draft=json.loads(proposal_path.read_text(encoding='utf-8')))]
                 continue
             write('agent1_draft_' + str(revision) + '.json', draft)
-            event('Agent1','semantic_plan_created', steps=len(draft['steps']))
+            event('Agent1','semantic_plan_created', steps=len(draft['steps']), **(dict(
+                plan_steps=draft['steps'], plan_oracles=[{k:o[k] for k in
+                    ('id','step_id','kind','expected','source_type','source_quote') if k in o}
+                    for o in draft['oracles']]) if demo else {}))
             stage = 'Agent2'
             event('Agent2', 'started', phase='planning_review')
             decision = Agent2TestReviewer().review_dynamic(draft, llm=llm)
             reviews.append(decision)
             write('agent2_reviews.json',reviews)
             write('input_review.json',dict(decision,revision=revision))
-            event('Agent2', 'review_finished', approved=decision['approved'])
+            event('Agent2', 'review_finished', approved=decision['approved'],
+                  **(dict(issues=decision.get('issues',[])) if demo else {}))
             if decision['approved'] and not draft.get('missing_inputs'):
                 approved = dict(draft, revision=revision, requirement_id=requirement_id)
                 validate_dynamic_plan(approved)
@@ -406,7 +431,9 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         return digest
 
     try:
-        event('Pipeline', 'run_started', run_dir=str(run_dir))
+        event('Pipeline', 'run_started', run_dir=str(run_dir), **(dict(goal=requirement) if demo else {}))
+        if demo and presentation.get('warning'):
+            event('Runtime','layout_warning',warning=presentation['warning'])
         if llm is None:
             from .llm_adapter import StructuredLLM
             llm = StructuredLLM(provider=provider or 'deepseek', model=model)
@@ -470,7 +497,8 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                             entry_validation='saved_prefix_replay' if entry_replayed else 'unchanged_observed_state')
                     attempts[step['id']] = attempts.get(step['id'],0)+1
                     name = 'agent3_' + step['id'] + '_' + uuid.uuid4().hex[:8]
-                    event('Agent3','generate_step',step_id=step['id'],attempt=attempts[step['id']])
+                    event('Agent3','generate_step',step_id=step['id'],attempt=attempts[step['id']],
+                          **(dict(goal=step['goal'],current_url=observation.get('url')) if demo else {}))
                     try:
                         proposal = generator.develop_step(contract,step,observation,llm=llm,
                             previous=previous,error=error,proposal_path=run_dir/(name+'.json'),
@@ -480,6 +508,8 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                         previous = proposal
                         (run_dir/(name+'.py')).write_text(source,encoding='utf-8')
                         write(name+'.json',proposal)
+                        if demo:
+                            event('Agent3','code_generated',step_id=step['id'],code=source)
                         result = trial.execute_checked(source,step_id=step['id'],queries=proposal['bindings'])
                         event('Runtime','step_executed',step_id=step['id'],phase='development',
                               status=result['status'],session_id=result.get('session_id'),
@@ -496,6 +526,8 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                         proposal_path = run_dir/(name+'.json')
                         if proposal_path.exists():
                             previous = json.loads(proposal_path.read_text(encoding='utf-8'))
+                            if demo and isinstance(previous.get('code'),str):
+                                event('Agent3','code_generated',step_id=step['id'],code=previous['code'],status='REJECTED')
                         result = dict(status='REJECTED',error_type=type(exc).__name__,error=str(exc)[:1200],
                                       step_id=step['id'])
                     debug.append(dict(step_id=step['id'],attempt=attempts[step['id']],proposal_ref=name,
@@ -532,7 +564,8 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                                     implementation+[dict(id=step['id'],source=source)],llm=llm,
                                     bindings=dict(bindings,**proposal['bindings']),checkpoints=checkpoints)
                                 write('blockage_review_'+uuid.uuid4().hex[:6]+'.json',dict(candidate=candidate,review=decision))
-                                event('Agent2','blockage_reviewed',approved=decision['approved'],oracle_id=oracle['id'])
+                                event('Agent2','blockage_reviewed',approved=decision['approved'],oracle_id=oracle['id'],
+                                      **(dict(issues=decision.get('issues',[])) if demo else {}))
                                 stage = 'Agent3'
                                 if decision['approved']:
                                     blockage = dict(candidate,review=decision)
@@ -573,6 +606,7 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                 if blockage:
                     break
             path, digest = generator.freeze_dynamic(implementation,run_dir=run_dir)
+            if demo: event('Agent3','source_frozen',script_sha256=digest)
             stage = 'Agent2Implementation'
             event('Agent2', 'started', phase='implementation_review')
             review = (dict(approved=True,issues=[],reason='Prefix and negative-evidence plan reviewed by Agent2',
@@ -581,7 +615,8 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
                                                                 observation=observation,llm=llm,
                                                                 checkpoints=checkpoints))
             write('implementation_review_'+uuid.uuid4().hex[:6]+'.json',review)
-            event('Agent2', 'review_finished', approved=review['approved'])
+            event('Agent2', 'review_finished', approved=review['approved'],
+                  **(dict(issues=review.get('issues',[])) if demo else {}))
             if not review['approved']:
                 category = review['issue_type']
                 failure = dict(error_type='ImplementationReviewRejected',issue_type=category,
@@ -710,6 +745,11 @@ def _run_dynamic(*, requirement, url, headless, output_root, llm, provider, mode
         stage='Agent5'
         event('Agent5', 'started')
         verdict = Agent5EvidenceVerifier().verify_dynamic(contract,evidence).to_dict()
+        if demo:
+            for check in verdict.get('checks',[]):
+                event('Agent5','check_finished',**{k:check[k] for k in
+                    ('oracle_id','expected','actual','passed','observation_ref','screenshot_ref') if k in check},
+                    status='PASS' if check.get('passed') is True else 'FAIL' if check.get('passed') is False else 'INCONCLUSIVE')
         verdict['validation_scope'] = contract.get('validation_scope','undetermined')
         if blockage:
             verdict.update(execution_scope=evidence['execution_scope'],skipped_steps=evidence['skipped_steps'])

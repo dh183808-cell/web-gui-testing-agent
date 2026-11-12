@@ -8,6 +8,7 @@ import streamlit as st
 from web_agent.ui_tasks import (STAGE_LABELS, PROVIDER_LABELS, TaskStore, artifact_path,
                                 progress_view, read_json, result_view, provider_defaults)
 from web_agent.llm_adapter import StructuredLLM, public_config, safe_model_error
+from web_agent.desktop_layout import freeze_presentation
 
 
 st.set_page_config(page_title='WebAgent · 测试操作台', page_icon='🧪', layout='wide')
@@ -56,7 +57,7 @@ def new_task():
 
 
 with st.sidebar:
-    st.markdown('### WebAgent v0.6')
+    st.markdown('### WebAgent')
     st.caption('测试操作台 · 本地单任务服务')
     if active_id:
         st.info('有一个任务正在执行')
@@ -75,7 +76,7 @@ with st.sidebar:
                  format_func=lambda key: labels.get(key, '选择历史任务'), on_change=select_history)
     st.caption('查看记录不会调用模型或启动浏览器。')
     st.divider()
-    st.caption('编写调试与完整模拟运行：后台执行\n\n正式测试：独立可见 Chrome\n\n刷新后继续查看同一任务。')
+    st.caption('常规：调试与冷启动在后台，正式 Chrome 可见。\n\n演示：Trial 与 Formal 可见，Cold 在后台。\n\n刷新后继续查看同一任务。')
 
 st.title('WebAgent · Web GUI 测试操作台')
 if selected:
@@ -125,6 +126,15 @@ def configure():
         left, right = st.columns(2)
         with left: st.text_area('Test Basis · 测试依据（可选）', key='test_basis', height=145)
         with right: st.text_area('Test Requirement · 测试需求', key='requirement', height=145)
+        st.radio('运行模式', ['normal', 'demo'], key='run_mode', horizontal=True,
+                 format_func=lambda mode: '常规模式' if mode == 'normal' else '演示模式')
+        if st.session_state['run_mode'] == 'demo':
+            desktop = freeze_presentation('demo')
+            if desktop.get('warning'): st.warning(desktop['warning'])
+            else: st.caption('测试 Chrome 自动定位到右半屏 · ' + desktop['monitor'])
+            st.caption('详细日志实时输出到启动 Streamlit 的同一个终端。请自行摆好左侧 VS Code 终端和右侧前端；无需额外启动终端。')
+            st.caption('Trial 可见、Cold 无头、Formal 独立可见。终端将展示本次公开任务、规划、审核及生成代码；'
+                       '请使用不含隐私的演示数据。半屏可能触发网页响应式布局。模式在启动时冻结。')
         st.slider('正式执行页面停留时间（秒）', 0.0, 3.0, 1.5, .5, key='formal_demo_delay',
                   help='正式取证完成后停留展示；对时间敏感的网站请设为 0。后台调试不延时。')
         consent = st.checkbox('我授权此次站点测试与独立重跑，并确认使用可安全重复的测试数据', key='authorized')
@@ -138,7 +148,8 @@ def configure():
                                      request_id=st.session_state['request_id'],
                                      ai_config=public_config(st.session_state['ai_provider'], st.session_state['model'],
                                          st.session_state['base_url'], st.session_state['json_mode']),
-                                     api_key=st.session_state['api_key'], formal_demo_delay=st.session_state['formal_demo_delay'])
+                                     api_key=st.session_state['api_key'], formal_demo_delay=st.session_state['formal_demo_delay'],
+                                     run_mode=st.session_state['run_mode'])
                 st.session_state['clear_api_key'] = True
                 st.query_params['job'] = job_id
                 st.rerun()
@@ -155,6 +166,7 @@ def readonly_config(job):
         config = job.get('ai_config', {})
         if config: st.text('AI：' + PROVIDER_LABELS.get(config['provider'], config['provider']) + ' / ' + config['model'])
         if 'formal_demo_delay' in job: st.text(f"正式页面停留：{job['formal_demo_delay']:g} 秒")
+        st.text('运行模式：' + ('演示模式' if job.get('presentation',{}).get('mode') == 'demo' else '常规模式'))
 
 
 def stage_cards(view):
@@ -176,6 +188,7 @@ def progress_panel(job):
     st.subheader(('正在执行 · ' + current) if running else '执行记录')
     config = job.get('ai_config', {})
     if config: st.caption(PROVIDER_LABELS.get(config['provider'], config['provider']) + ' / ' + config['model'])
+    if job.get('presentation',{}).get('warning'): st.warning(job['presentation']['warning'])
     cols = st.columns([1.25, 1, 1.25, 1, 1])
     values = [view['step'], f"{view['elapsed']:.1f}s", f"{view['calls_finished']} / {view['calls']}",
               f"{view['current_seconds'] or 0:.1f}s" if running else '已结束', f"{view['repairs']} / 5"]

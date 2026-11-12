@@ -310,7 +310,8 @@ class TaskStore:
                       + ' · ' + (job.get('result') or {}).get('verdict', {}).get('status', job['status'])
                       + ' · ' + job['inputs']['requirement'][:18] + ' · ' + job['id'][:8]) for job in recent]
 
-    def start(self, inputs, *, request_id, ai_config=None, api_key='', formal_demo_delay=1.5):
+    def start(self, inputs, *, request_id, ai_config=None, api_key='', formal_demo_delay=1.5,
+              run_mode='normal', demo_layout=None):
         from .checked_selenium import origin
         uuid.UUID(hex=request_id)
         origin(inputs['url'])
@@ -325,9 +326,12 @@ class TaskStore:
             ai_config = public_config(**(ai_config or {}))
             from .selenium_runtime import validate_presentation_delay
             formal_demo_delay = validate_presentation_delay(formal_demo_delay)
+            from .desktop_layout import freeze_presentation
+            presentation = freeze_presentation(run_mode, demo_layout)
             job = dict(id=request_id, inputs=inputs, status='RUNNING', started_at=time.time(),
                        started_utc=datetime.now(timezone.utc).isoformat(), events=[], result=None,
-                       ai_config=ai_config, formal_demo_delay=formal_demo_delay)
+                       ai_config=ai_config, formal_demo_delay=formal_demo_delay,
+                       presentation=presentation)
             self.jobs[request_id] = job
             self._save(job)
             thread = threading.Thread(target=self._run, args=(request_id, api_key.strip()), daemon=True,
@@ -342,13 +346,19 @@ class TaskStore:
 
     def _run(self, job_id, api_key):
         def progress(record):
+            if console: console(record)
             with self.lock:
                 job['events'].append(record)
                 if record['action'] == 'run_started': job['run_dir'] = record['run_dir']
                 self._save(job)
         job = self.jobs[job_id]
         llm = None
+        console = None
         try:
+            presentation = deepcopy(job.get('presentation', dict(mode='normal')))
+            if presentation['mode'] == 'demo':
+                from .demo_console import DemoConsole
+                console = DemoConsole(secrets=(api_key,))
             llm = self.llm_factory(**job['ai_config'], api_key=api_key, use_environment=False)
             api_key = None
             result = self.runner(target='dynamic', mode='llm', llm=llm,
@@ -356,6 +366,7 @@ class TaskStore:
                 start_url=job['inputs']['url'], requirement=job['inputs']['requirement'],
                 test_basis=job['inputs']['test_basis'], allow_live_site=True, allow_local_research=True,
                 headless=True, formal_headless=False, formal_demo_delay=job['formal_demo_delay'],
+                run_mode=presentation['mode'], demo_layout=presentation,
                 progress_callback=progress)
             # Cleanup may update the verdict in finally; disk is authoritative.
             verdict = read_json(Path(result['run_dir'])/'final_verdict.json', result['verdict'])
@@ -366,6 +377,7 @@ class TaskStore:
             with self.lock: job.update(status='ERROR', error_type=type(exc).__name__, error_message=safe_model_error(exc))
         finally:
             api_key = None
+            if console: console.close()
             if llm:
                 try: llm.close()
                 except Exception: pass

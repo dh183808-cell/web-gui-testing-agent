@@ -169,6 +169,10 @@ def main():
             with (run_dir/'browser_actions.jsonl').open('a',encoding='utf-8') as trace:
                 trace.write(json.dumps(dict(step_id=request.get('step_id'),
                     browser_session_id=driver.session_id,**action),ensure_ascii=True)+'\n')
+            if config.get('presentation_events'):
+                # Metadata only: never send input values, SDK objects or raw page content.
+                reply({'_presentation_action':dict(operation=action.get('action'),
+                    action_status=action.get('status'), error_type=action.get('error_type'))})
         def record_measurement(record):
             with (run_dir/'oracle_capture.jsonl').open('a',encoding='utf-8') as trace:
                 trace.write(json.dumps(dict(browser_session_id=driver.session_id,**record),ensure_ascii=True)+'\n')
@@ -185,7 +189,12 @@ def main():
             driver = make_driver(profile_dir=profile, driver_path=config.get('driver_path'),
                                  chrome_binary=config.get('chrome_binary'),
                                  service_log=run_dir / 'chromedriver.log', headless=config['headless'],
-                                 page_load_strategy='eager' if config.get('research_mode') else 'normal')
+                                 page_load_strategy='eager' if config.get('research_mode') else 'normal',
+                                 **({'window_rect':config['window_rect']} if config.get('window_rect') else {}))
+            layout_result = None
+            if config.get('window_rect') and not config['headless']:
+                from .desktop_layout import place_chrome
+                layout_result = place_chrome(driver, config['window_rect'])
             driver.get(base_url)
             # Trusted control-side diagnostic; do not expose full command-line paths.
             try:
@@ -194,6 +203,7 @@ def main():
             except Exception:
                 browser_headless = None  # Diagnostic availability must not break a session.
             reply({'status': 'READY', 'browser_session_id': driver.session_id,
+                   'window_layout': layout_result,
                    'browser_headless': browser_headless,
                    'browser_version': driver.capabilities.get('browserVersion'),
                    'profile_id': str(profile), 'data_id': base_url,

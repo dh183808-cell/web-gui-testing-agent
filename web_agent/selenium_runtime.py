@@ -181,7 +181,7 @@ class LocalSession:
     """
     def __init__(self, run_dir: Path, *, purpose='trial', seed='phase1', limits=None,
                  headless=True, driver_path=None, chrome_binary=None, start_url=None, research_mode=False,
-                 formal_demo_delay=0.0):
+                 formal_demo_delay=0.0, window_rect=None, presentation_events=False):
         if purpose not in {'trial', 'development', 'formal'}:
             raise ValueError('Invalid execution purpose')
         if not isinstance(seed, str) or len(seed) > 100:
@@ -209,8 +209,10 @@ class LocalSession:
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.research_mode = research_mode
         self.progress_callback = None
+        self.presentation_events = bool(presentation_events)
         self._options = dict(headless=headless, driver_path=driver_path, chrome_binary=chrome_binary,
-                             start_url=start_url, research_mode=research_mode, formal_demo_delay=self.formal_demo_delay)
+                             start_url=start_url, research_mode=research_mode, formal_demo_delay=self.formal_demo_delay,
+                             window_rect=window_rect, presentation_events=self.presentation_events)
         self._root = root
         self._responses = queue.Queue()
         self._lock = threading.RLock()
@@ -243,7 +245,8 @@ class LocalSession:
             config = dict(run_dir=str(self.run_dir), seed=seed, headless=headless,
                           start_url=start_url, research_mode=research_mode,
                           driver_path=str(driver_path or os.getenv('CHROMEDRIVER_PATH') or '') or None,
-                          chrome_binary=str(chrome_binary or os.getenv('CHROME_BINARY') or '') or None)
+                          chrome_binary=str(chrome_binary or os.getenv('CHROME_BINARY') or '') or None,
+                          window_rect=window_rect, presentation_events=self.presentation_events)
             response = self._request(config, self.limits.startup_seconds)
             if response.get('status') != 'READY':
                 raise LocalRuntimeUnavailable(response.get('error_type', 'Browser startup failed') + ': ' + response.get('error', ''))
@@ -307,6 +310,11 @@ class LocalSession:
                             'request' if now >= request_deadline else 'phase')
                         raise RuntimePhaseTimeout(phase,partial,now-phase_started,scope) from None
                     raise TimeoutError('Managed execution deadline exceeded') from None
+                if '_presentation_action' in result:
+                    if payload.get('op') == 'checked' and getattr(self, 'presentation_events', False):
+                        self._progress('browser_action', step_id=payload.get('step_id'),
+                                       **result['_presentation_action'])
+                    continue
                 if not phase_limits or '_runtime_phase' not in result:
                     break
                 name = result['_runtime_phase']
@@ -352,7 +360,9 @@ class LocalSession:
             self._progress('step_started', step_id=step_id)
             result = self._execute_research(source, step_id=step_id, queries=queries or {})
             self._progress('step_finished', step_id=step_id, status=result['status'],
-                           timings=result.get('timings'), elapsed_seconds_step=result.get('elapsed_seconds'))
+                           timings=result.get('timings'), elapsed_seconds_step=result.get('elapsed_seconds'),
+                           **(dict(error_type=result.get('error_type'), observation_ref=result.get('observation_ref'),
+                               screenshot_ref=result.get('screenshot_ref')) if getattr(self,'presentation_events',False) else {}))
             return result
         result = dict(status='REJECTED', error_type='UntrustedCodeDisabled',
                       error='Arbitrary Python execution is disabled in local mode; use a reviewed script ID',
@@ -547,14 +557,18 @@ def create_session(run_dir: Path, *, purpose='trial', **options) -> LocalSession
 
 def make_driver(*, headless: bool = True, profile_dir: Path | None = None,
                 proxy_url: str | None = None, driver_path=None, chrome_binary=None, service_log=None,
-                page_load_strategy='normal'):
+                page_load_strategy='normal', window_rect=None):
     """Import Selenium lazily so contract/generation tests work without a browser."""
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
 
     opts = Options()
-    opts.add_argument("--window-size=1440,1000")
+    if window_rect and not headless:
+        opts.add_argument(f"--window-position={window_rect['x']},{window_rect['y']}")
+        opts.add_argument(f"--window-size={window_rect['width']},{window_rect['height']}")
+    else:
+        opts.add_argument("--window-size=1440,1000")
     if headless:
         opts.add_argument("--headless=new")
     if os.name == "posix":
